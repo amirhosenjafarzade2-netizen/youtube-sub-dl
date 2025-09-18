@@ -71,7 +71,15 @@ def get_available_manual_languages(url, is_playlist):
             info = ydl.extract_info(info['entries'][0]['url'], download=False)
         return list(info.get('subtitles', {}).keys()) or ['en']  # Fallback to English
 
-def download_subtitles(url, sub_type, lang, format_choice, output_dir, is_playlist, progress_bar, total_videos, clean_transcript):
+def find_subtitle_file(base_path, lang):
+    """Find subtitle file, checking for .srt and .auto.srt variants."""
+    for ext in ['.srt', f'.{lang}.srt', f'.{lang}.auto.srt']:
+        candidate = base_path + ext
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+def download_subtitles(url, sub_type, lang, format_choice, output_dir, is_playlist, progress_bar, total_videos, clean_transcript, prefer_manual_only):
     """Download subtitles with progress bar."""
     os.makedirs(output_dir, exist_ok=True)
 
@@ -84,47 +92,57 @@ def download_subtitles(url, sub_type, lang, format_choice, output_dir, is_playli
     ydl_opts = {
         'skip_download': True,
         'outtmpl': os.path.join(output_dir, '%(title)s.%(ext)s'),
-        'subtitlesformat': 'srt/best',  # Start with best available
+        'subtitlesformat': 'srt/best',  # Force SRT for consistency
     }
 
     if format_choice == 'vtt':
         ydl_opts['convertsubtitles'] = 'vtt'
 
+    langs = lang if isinstance(lang, list) else [lang]
     if sub_type == 'original':
-        ydl_opts['writesubtitles'] = True
-        ydl_opts['writeautomaticsub'] = False
-        ydl_opts['subtitleslangs'] = lang if lang else ['all']  # lang is list
+        ydl_opts['writesubtitles'] = True  # Always enable manual
+        ydl_opts['writeautomaticsub'] = not prefer_manual_only  # Fallback to auto if allowed
+        ydl_opts['subtitleslangs'] = langs if langs else ['all']
     else:  # auto-translate
         ydl_opts['writesubtitles'] = False
         ydl_opts['writeautomaticsub'] = True
-        ydl_opts['subtitleslangs'] = [lang] if isinstance(lang, str) else lang
+        ydl_opts['subtitleslangs'] = langs
 
     subtitle_files = []
     for i, entry in enumerate(entries, 1):
         try:
             with YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(entry['url'], download=True)
-                langs = lang if isinstance(lang, list) else [lang]
+                base_path = ydl.prepare_filename(info).rsplit('.', 1)[0]
+                sub_file = None
                 for l in langs:
-                    ext = format_choice if format_choice != 'txt' else 'srt'
-                    sub_file = ydl.prepare_filename(info).rsplit('.', 1)[0] + f".{l}.{ext}"
-                    if os.path.exists(sub_file):
-                        final_file = sub_file
-                        if format_choice == 'txt':
-                            final_file = convert_srt_to_txt(sub_file)
-                        if clean_transcript:
-                            with open(final_file, 'r+', encoding='utf-8') as f:
-                                content = f.read()
-                                f.seek(0)
-                                f.write(clean_subtitle_text(content))
-                                f.truncate()
-                        subtitle_files.append((entry['title'], final_file))
-                    else:
-                        st.warning(f"No subtitle found for {entry['title']} in language {l}")
+                    candidate = find_subtitle_file(base_path, l)
+                    if candidate:
+                        sub_file = candidate
+                        break
+                if sub_file:
+                    final_file = sub_file
+                    if format_choice == 'txt':
+                        final_file = convert_srt_to_txt(sub_file)
+                    if clean_transcript:
+                        with open(final_file, 'r+', encoding='utf-8') as f:
+                            content = f.read()
+                            f.seek(0)
+                            f.write(clean_subtitle_text(content))
+                            f.truncate()
+                    subtitle_files.append((entry['title'], final_file))
+                else:
+                    # List available subs for debugging
+                    list_opts = {'listsubtitles': True, 'quiet': True}
+                    with YoutubeDL(list_opts) as ydl_list:
+                        list_info = ydl_list.extract_info(entry['url'], download=False)
+                        avail_manual = list(list_info.get('subtitles', {}).keys())
+                        avail_auto = list(list_info.get('automatic_captions', {}).keys())
+                        st.warning(f"No subtitle found for '{entry['title']}'. Available manual: {avail_manual}. Available auto: {avail_auto}.")
             # Update progress bar
             progress_bar.progress(min(i / total_videos, 1.0))
         except Exception as e:
-            st.warning(f"Error for {entry.get('title', 'unknown')}: {e}")
+            st.warning(f"Error for '{entry.get('title', 'unknown')}': {e}")
 
     return output_dir, title, subtitle_files, is_playlist
 
@@ -182,7 +200,7 @@ def main():
     with st.sidebar:
         st.header("Settings")
         url = st.text_input("YouTube URL", placeholder="Paste video or playlist URL here...")
-        sub_type = st.selectbox("Subtitle Type", ["Original (all languages)", "Auto-translate"], help="Original: Manual subtitles; Auto-translate: Automatic captions/translations.")
+        sub_type = st.selectbox("Subtitle Type", ["Original (all languages)", "Auto-translate"], help="Original: Manual subtitles (with auto-fallback if enabled); Auto-translate: Automatic captions/translations.")
         
         # Initialize lang variable
         lang = 'en'  # Default
@@ -200,6 +218,7 @@ def main():
                 available_manual_langs = ['en']
         if sub_type == 'Original (all languages)':
             lang = st.multiselect("Select Original Languages", available_manual_langs, default=available_manual_langs, help="Select specific languages or leave for all.")
+            prefer_manual_only = st.checkbox("Prefer Manual Only (No Auto-Fallback)", value=False, help="Disable auto-generated subs if manual ones are missing.")
         else:
             lang = st.selectbox("Auto-translate Language", available_languages, help="Select a language for auto-translated subtitles")
 
@@ -230,14 +249,14 @@ def main():
                 total_videos = len(get_info(selected_url, is_playlist)[0])
 
                 output_dir, title, subtitle_files, _ = download_subtitles(
-                    selected_url, sub_type.lower().split()[0], lang, format_choice, temp_dir, is_playlist, progress_bar, total_videos, clean_transcript
+                    selected_url, sub_type.lower().split()[0], lang, format_choice, temp_dir, is_playlist, progress_bar, total_videos, clean_transcript, prefer_manual_only if sub_type == 'Original (all languages)' else False
                 )
 
                 # Clear progress bar
                 progress_container.empty()
 
                 if not subtitle_files:
-                    st.warning("No subtitles downloaded.")
+                    st.warning("No subtitles downloaded. Try enabling auto-fallback or check available languages.")
                     return
 
                 if is_playlist and combine_choice == 'combined':

@@ -73,20 +73,43 @@ def get_available_manual_languages(url, is_playlist):
         return list(info.get('subtitles', {}).keys()) or ['en']  # Fallback to English
 
 def find_subtitle_file(base_path, lang, format_choice):
-    """Find subtitle file, checking for various extensions and auto variants."""
-    patterns = [
-        f"{base_path}.{lang}.{format_choice}",
-        f"{base_path}.{lang}.auto.{format_choice}",
-        f"{base_path}.{lang}.srt",
-        f"{base_path}.{lang}.auto.srt",
-        f"{base_path}.*.{format_choice}",  # Broader search
-        f"{base_path}.*.auto.{format_choice}",
-    ]
+    """Find subtitle file, checking for various extensions and language variants."""
+    # Include language variants like 'tr-orig' for 'tr'
+    lang_variants = [lang]
+    if '-' not in lang:
+        lang_variants.append(f"{lang}-orig")
+    elif lang.endswith('-orig'):
+        lang_variants.append(lang.replace('-orig', ''))
+    
+    patterns = []
+    for l in lang_variants:
+        # Check for both requested format and SRT (in case of conversion issues)
+        patterns.extend([
+            f"{base_path}.{l}.{format_choice}",
+            f"{base_path}.{l}.auto.{format_choice}",
+            f"{base_path}.{l}.srt",
+            f"{base_path}.{l}.auto.srt",
+            f"{base_path}.{l}.vtt",
+            f"{base_path}.{l}.auto.vtt",
+            f"{base_path}.*.{format_choice}",
+            f"{base_path}.*.auto.{format_choice}",
+        ])
     for pattern in patterns:
         matches = glob.glob(pattern)
         if matches:
             return matches[0]  # Return first match
     return None
+
+def convert_vtt_to_srt(vtt_path):
+    """Convert VTT to SRT format."""
+    srt_path = vtt_path.rsplit('.', 1)[0] + '.srt'
+    with open(vtt_path, 'r', encoding='utf-8') as vtt_file, open(srt_path, 'w', encoding='utf-8') as srt_file:
+        srt_file.write("WEBVTT\n\n")
+        for line in vtt_file:
+            if line.strip() == 'WEBVTT':
+                continue
+            srt_file.write(line)
+    return srt_path
 
 def download_subtitles(url, sub_type, lang, format_choice, output_dir, is_playlist, progress_bar, total_videos, clean_transcript, prefer_manual_only):
     """Download subtitles with progress bar."""
@@ -111,7 +134,7 @@ def download_subtitles(url, sub_type, lang, format_choice, output_dir, is_playli
     if sub_type == 'original':
         ydl_opts['writesubtitles'] = True
         ydl_opts['writeautomaticsub'] = not prefer_manual_only
-        ydl_opts['subtitleslangs'] = langs if langs else ['en']  # Fallback to 'en'
+        ydl_opts['subtitleslangs'] = langs if langs else ['en']
     else:  # auto-translate
         ydl_opts['writesubtitles'] = False
         ydl_opts['writeautomaticsub'] = True
@@ -127,8 +150,11 @@ def download_subtitles(url, sub_type, lang, format_choice, output_dir, is_playli
                     sub_file = find_subtitle_file(base_path, l, format_choice if format_choice != 'txt' else 'srt')
                     if sub_file:
                         final_file = sub_file
+                        # Convert VTT to SRT if needed and not already VTT
+                        if format_choice != 'vtt' and sub_file.endswith('.vtt'):
+                            final_file = convert_vtt_to_srt(sub_file)
                         if format_choice == 'txt':
-                            final_file = convert_srt_to_txt(sub_file)
+                            final_file = convert_srt_to_txt(final_file)
                         if clean_transcript:
                             with open(final_file, 'r+', encoding='utf-8') as f:
                                 content = f.read()
@@ -143,7 +169,7 @@ def download_subtitles(url, sub_type, lang, format_choice, output_dir, is_playli
                             list_info = ydl_list.extract_info(entry['url'], download=False)
                             avail_manual = list(list_info.get('subtitles', {}).keys())
                             avail_auto = list(list_info.get('automatic_captions', {}).keys())
-                            checked_paths = [p for p in glob.glob(f"{base_path}.*")]
+                            checked_paths = glob.glob(f"{base_path}.*")
                             st.warning(f"No subtitle found for '{entry['title']}' in language '{l}'. Available manual: {avail_manual}. Available auto: {avail_auto}. Checked paths: {checked_paths}")
             # Update progress bar
             progress_bar.progress(min(i / total_videos, 1.0))
@@ -223,10 +249,10 @@ def main():
                 available_languages = ['en']  # Fallback if URL is invalid
                 available_manual_langs = ['en']
         if sub_type == 'Original (all languages)':
-            lang = st.multiselect("Select Original Languages", available_manual_langs, default=['en'], help="Select specific languages or leave for all. Auto-fallback included unless disabled.")
+            lang = st.multiselect("Select Original Languages", available_manual_langs, default=['tr' if 'tr' in available_manual_langs else 'en'], help="Select specific languages or leave for all. Auto-fallback included unless disabled.")
             prefer_manual_only = st.checkbox("Prefer Manual Only (No Auto-Fallback)", value=False, help="Disable auto-generated subs if manual ones are missing.")
         else:
-            lang = st.selectbox("Auto-translate Language", available_languages, help="Select a language for auto-translated subtitles")
+            lang = st.selectbox("Auto-translate Language", available_languages, index=available_languages.index('tr') if 'tr' in available_languages else 0, help="Select a language for auto-translated subtitles")
 
         format_choice = st.selectbox("Format", ["srt", "vtt", "txt"], help="SRT/VTT include timestamps; TXT is plain text.")
         clean_transcript = st.checkbox("Clean Transcript (Remove ads/timestamps)", value=True, help="Remove advertisements and normalize formatting in subtitles.")
@@ -262,7 +288,7 @@ def main():
                 progress_container.empty()
 
                 if not subtitle_files:
-                    st.warning("No subtitles downloaded. Try enabling auto-fallback or selecting a different language.")
+                    st.warning("No subtitles downloaded. Try enabling auto-fallback or selecting a different language (e.g., 'tr' or 'tr-orig').")
                     return
 
                 if is_playlist and combine_choice == 'combined':

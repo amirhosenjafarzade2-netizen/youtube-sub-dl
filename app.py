@@ -108,12 +108,7 @@ def get_info(url, is_playlist, cookies_file=None):
         'cookiefile': cookies_file,
         'restrict_filenames': True,
         'no_check_certificate': True,
-   ස
-
-System: The response was cut off due to length. Here's the continuation and completion of the modified Streamlit program, along with further guidance to resolve the subtitle download issue.
-
-<xaiArtifact artifact_id="b8ad107a-67f3-41e0-9a59-4f3e82cdae96" artifact_version_id="c382ab19-8d96-4505-acee-cd24636c298e" title="youtube_subtitle_downloader_minimal.py" contentType="text/python">
-, 'ignoreerrors': True,
+        'ignoreerrors': True,
     }
     with YoutubeDL(ydl_opts) as ydl:
         try:
@@ -127,7 +122,7 @@ System: The response was cut off due to length. Here's the continuation and comp
         except Exception as e:
             raise Exception(f"Error fetching info: {str(e)}")
 
-def find_subtitle_file(base_path, format_choice):
+def find_subtitle_file(temp_dir, base_path, format_choice):
     """Find subtitle file for any available language with broader pattern matching."""
     patterns = [
         f"{base_path}*.{format_choice}",
@@ -136,6 +131,12 @@ def find_subtitle_file(base_path, format_choice):
         f"{base_path}*.auto.srt",
         f"{base_path}*.vtt",
         f"{base_path}*.auto.vtt",
+        f"{temp_dir}/*.{format_choice}",
+        f"{temp_dir}/*.auto.{format_choice}",
+        f"{temp_dir}/*.srt",
+        f"{temp_dir}/*.auto.srt",
+        f"{temp_dir}/*.vtt",
+        f"{temp_dir}/*.auto.vtt",
     ]
     logging.debug(f"Searching for subtitle files with base_path: {base_path}, patterns: {patterns}")
     for pattern in patterns:
@@ -146,8 +147,8 @@ def find_subtitle_file(base_path, format_choice):
             logging.debug(f"Selected subtitle file: {matches[0]}, language: {selected_language}")
             return matches[0], selected_language
     
-    # Broader search for any subtitle file
-    wildcard_pattern = f"{base_path}*.*"
+    # Try any file in temp_dir
+    wildcard_pattern = f"{temp_dir}/*.*"
     matches = glob.glob(wildcard_pattern)
     logging.debug(f"Wildcard pattern {wildcard_pattern} found matches: {matches}")
     if matches:
@@ -155,7 +156,7 @@ def find_subtitle_file(base_path, format_choice):
         logging.debug(f"Selected subtitle file (wildcard): {matches[0]}, language: {selected_language}")
         return matches[0], selected_language
     
-    logging.warning(f"No subtitle files found for base_path: {base_path}")
+    logging.warning(f"No subtitle files found in temp_dir: {temp_dir}")
     return None, None
 
 def convert_vtt_to_srt(vtt_path):
@@ -282,6 +283,7 @@ def download_subtitles(url, format_choice, temp_dir, is_playlist, progress_bar, 
             video_url = f"https://www.youtube.com/watch?v={video_id}" if is_playlist else url
             sanitized_title = sanitize_filename(video_title)[:150]
             base_path = os.path.join(temp_dir, sanitized_title)
+            logging.debug(f"Temporary directory: {temp_dir}")
             logging.debug(f"Downloading subtitles for {video_url}, base_path: {base_path}")
             
             start_time = time.time()
@@ -298,7 +300,7 @@ def download_subtitles(url, format_choice, temp_dir, is_playlist, progress_bar, 
             temp_files = glob.glob(os.path.join(temp_dir, '*'))
             logging.debug(f"Files in temp_dir after download: {temp_files}")
             
-            sub_path, selected_language = find_subtitle_file(base_path, format_choice)
+            sub_path, selected_language = find_subtitle_file(temp_dir, base_path, format_choice)
             
             if sub_path:
                 if format_choice == 'txt':
@@ -456,12 +458,10 @@ def main():
                     elif is_playlist and combine_choice == 'separate':
                         zip_buffer, zip_name = create_zip(subtitle_files, title)
                         st.download_button(
-                            "Download ZIP",ക
-
-System: The response was cut off again due to length constraints. I'll complete the program and provide additional guidance to ensure subtitles are downloaded successfully, especially since you confirmed the video has subtitles but didn't upload a cookies file.
-
-<xaiArtifact artifact_id="37644454-59d4-49d2-b451-bdd88330aa80" artifact_version_id="17ca2a0b-2d1f-483c-977a-009131f0f464" title="youtube_subtitle_downloader_minimal.py" contentType="text/python">
-, zip_buffer, file_name=zip_name, mime="application/zip"
+                            "Download ZIP",
+                            zip_buffer,
+                            file_name=zip_name,
+                            mime="application/zip"
                         )
                     else:
                         if subtitle_files:

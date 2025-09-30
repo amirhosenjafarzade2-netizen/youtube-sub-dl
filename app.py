@@ -97,7 +97,7 @@ def get_first_video_id(info):
         return info['entries'][0].get('id')
     return None
 
-@retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=1, max=10))
+@retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=1, min=1, max=15))
 def get_info(url, is_playlist, cookies_file=None):
     """Fetch info for video or playlist with retry."""
     ydl_opts = {
@@ -113,6 +113,7 @@ def get_info(url, is_playlist, cookies_file=None):
     with YoutubeDL(ydl_opts) as ydl:
         try:
             result = ydl.extract_info(url, download=False)
+            logging.debug(f"Extracted info for URL {url}: {result}")
             if is_playlist:
                 if 'entries' not in result or not result['entries']:
                     raise Exception("No videos found in playlist.")
@@ -120,7 +121,8 @@ def get_info(url, is_playlist, cookies_file=None):
             else:
                 return [result], result.get('title', 'video_subtitles')
         except Exception as e:
-            raise Exception(f"Error fetching info: {str(e)}")
+            logging.error(f"Failed to fetch info for {url}: {str(e)}")
+            raise
 
 def find_subtitle_file(temp_dir, base_path, format_choice):
     """Find subtitle file for any available language with broader pattern matching."""
@@ -234,7 +236,7 @@ def create_zip(subtitle_files, title):
     zip_buffer.seek(0)
     return zip_buffer, f"{safe_title}_subtitles.zip"
 
-@retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=1, max=10))
+@retry(stop=stop_after_attempt(10), wait=wait_exponential(multiplier=1, min=1, max=15))
 def download_subtitles(url, format_choice, temp_dir, is_playlist, progress_bar, total_videos, clean_transcript, cookies_file=None):
     """Download all available subtitles for video or playlist with retry."""
     ydl_opts = {
@@ -286,8 +288,24 @@ def download_subtitles(url, format_choice, temp_dir, is_playlist, progress_bar, 
             logging.debug(f"Temporary directory: {temp_dir}")
             logging.debug(f"Downloading subtitles for {video_url}, base_path: {base_path}")
             
+            # Check if subtitles exist before downloading
+            ydl_check_opts = {
+                'listsubtitles': True,
+                'quiet': True,
+                'no_warnings': True,
+                'cookiefile': cookies_file,
+                'restrict_filenames': True,
+                'no_check_certificate': True,
+            }
+            with YoutubeDL(ydl_check_opts) as ydl_check:
+                info = ydl_check.extract_info(video_url, download=False)
+                if not info.get('subtitles') and not info.get('automatic_captions'):
+                    st.warning(f"No subtitles available for '{video_title}'")
+                    progress_bar.progress((i + 1) / total_videos)
+                    continue
+            
             start_time = time.time()
-            timeout = 60  # Increased timeout
+            timeout = 180  # Increased timeout to 180 seconds
             with YoutubeDL(ydl_opts) as ydl:
                 ydl.download([video_url])
             
@@ -323,6 +341,7 @@ def download_subtitles(url, format_choice, temp_dir, is_playlist, progress_bar, 
                 st.warning(f"No subtitles found for '{video_title}'")
         
         except Exception as e:
+            logging.error(f"Error downloading subtitles for '{video_title}' ({video_url}): {str(e)}")
             if "Sign in to confirm" in str(e):
                 st.error(f"YouTube requires sign-in for '{video_title}' ({video_id}). Upload a cookies file or disable VPN.")
             else:

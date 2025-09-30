@@ -92,12 +92,14 @@ def get_first_video_id(info):
         return info['entries'][0].get('id')
     return None
 
-def get_info(url, is_playlist):
+def get_info(url, is_playlist, cookies_file=None):
     """Fetch info for video or playlist."""
     ydl_opts = {
         'quiet': True,
         'extract_flat': True if is_playlist else False,
         'no_warnings': True,
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'cookiefile': cookies_file,
     }
     with YoutubeDL(ydl_opts) as ydl:
         try:
@@ -112,12 +114,14 @@ def get_info(url, is_playlist):
             raise Exception(f"Error fetching info: {str(e)}")
 
 @st.cache_data
-def get_available_subtitle_languages(url, is_playlist):
+def get_available_subtitle_languages(url, is_playlist, cookies_file=None):
     """Fetch available subtitle languages with timeout."""
     ydl_opts = {
         'quiet': True,
         'listsubtitles': True,
         'no_warnings': True,
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'cookiefile': cookies_file,
     }
     start_time = time.time()
     timeout = 10  # seconds
@@ -140,16 +144,21 @@ def get_available_subtitle_languages(url, is_playlist):
             
             return []
         except Exception as e:
-            st.warning(f"Error fetching subtitle languages: {str(e)}. Defaulting to English.")
+            if "Sign in to confirm" in str(e):
+                st.error("YouTube requires sign-in to access subtitle languages. Try uploading a cookies file or disabling VPN.")
+            else:
+                st.warning(f"Error fetching subtitle languages: {str(e)}. Defaulting to English.")
             return ['en']
 
 @st.cache_data
-def get_available_manual_languages(url, is_playlist):
+def get_available_manual_languages(url, is_playlist, cookies_file=None):
     """Fetch available manual subtitle languages with timeout."""
     ydl_opts = {
         'quiet': True,
         'listsubtitles': True,
         'no_warnings': True,
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'cookiefile': cookies_file,
     }
     start_time = time.time()
     timeout = 10  # seconds
@@ -172,7 +181,10 @@ def get_available_manual_languages(url, is_playlist):
             
             return []
         except Exception as e:
-            st.warning(f"Error fetching manual subtitle languages: {str(e)}. Defaulting to English.")
+            if "Sign in to confirm" in str(e):
+                st.error("YouTube requires sign-in to access manual subtitles. Try uploading a cookies file or disabling VPN.")
+            else:
+                st.warning(f"Error fetching manual subtitle languages: {str(e)}. Defaulting to English.")
             return ['en']
 
 def find_subtitle_file(base_path, lang_list, format_choice):
@@ -293,7 +305,7 @@ def create_zip(subtitle_files, title):
     zip_buffer.seek(0)
     return zip_buffer, f"{safe_title}_subtitles.zip"
 
-def download_subtitles(url, sub_type, lang, format_choice, temp_dir, is_playlist, progress_bar, total_videos, clean_transcript, prefer_manual_only):
+def download_subtitles(url, sub_type, lang, format_choice, temp_dir, is_playlist, progress_bar, total_videos, clean_transcript, prefer_manual_only, cookies_file=None):
     """Download subtitles for video or playlist."""
     lang_list = lang if isinstance(lang, list) else [lang]
     
@@ -306,16 +318,21 @@ def download_subtitles(url, sub_type, lang, format_choice, temp_dir, is_playlist
         'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
         'quiet': True,
         'no_warnings': True,
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'cookiefile': cookies_file,
     }
     
     subtitle_files = []
     try:
-        entries, title = get_info(url, is_playlist)
+        entries, title = get_info(url, is_playlist, cookies_file)
         if not entries:
             st.error("No videos found in the provided URL.")
             return temp_dir, title, subtitle_files
     except Exception as e:
-        st.error(f"Error fetching video info: {str(e)}")
+        if "Sign in to confirm" in str(e):
+            st.error("YouTube requires sign-in to access video info. Try uploading a cookies file or disabling VPN.")
+        else:
+            st.error(f"Error fetching video info: {str(e)}")
         return temp_dir, "unknown", []
     
     for i, entry in enumerate(entries):
@@ -368,7 +385,12 @@ def download_subtitles(url, sub_type, lang, format_choice, temp_dir, is_playlist
                 st.warning(f"No subtitles found for '{video_title}' in language(s): {', '.join(format_language_option(code) for code in lang_list)}")
         
         except Exception as e:
-            st.warning(f"Error downloading subtitles for '{video_title}': {str(e)}")
+            if "Sign in to confirm" in str(e):
+                st.error(f"YouTube requires sign-in for '{video_title}' ({video_id}). Try uploading a cookies file or disabling VPN.")
+            else:
+                st.warning(f"Error downloading subtitles for '{video_title}': {str(e)}")
+            progress_bar.progress((i + 1) / total_videos)
+            continue
         
         progress_bar.progress((i + 1) / total_videos)
     
@@ -387,10 +409,18 @@ def main():
     st.set_page_config(page_title="YouTube Subtitle Downloader", page_icon="🎥", layout="wide")
     st.title("YouTube Subtitle Downloader 🎥")
     st.markdown("Download subtitles from YouTube videos or playlists with a sleek interface and progress tracking!")
-
+    
     with st.sidebar:
         st.header("Settings")
         url = st.text_input("YouTube URL", placeholder="Paste video or playlist URL here...")
+        
+        cookies_file = None
+        uploaded_file = st.file_uploader("Upload YouTube Cookies (Optional)", type=["txt"], help="Export cookies from your browser (e.g., using a cookies.txt extension) to bypass 'Sign in to confirm you’re not a bot' errors.")
+        if uploaded_file:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as tmp_file:
+                tmp_file.write(uploaded_file.read())
+                cookies_file = tmp_file.name
+        
         sub_type = st.selectbox(
             "Subtitle Type", 
             ["Original (all languages)", "Auto-translate"], 
@@ -422,11 +452,11 @@ def main():
                             key="download_scope"
                         )
                     
-                    selected_url = corrected_playlist_url if url_type == 'playlist' or (url_type == 'both' and download_scope == 'Entire Playlist') else corrected_video_url
-                    is_playlist_temp = url_type == 'playlist' or (url_type == 'both' and download_scope == 'Entire Playlist')
+                    selected_url = corrected_playlist_url if url_type == 'playlist' or (url_type == 'both' and download_scope == "Entire Playlist") else corrected_video_url
+                    is_playlist_temp = url_type == 'playlist' or (url_type == 'both' and download_scope == "Entire Playlist")
                     
-                    available_languages = get_available_subtitle_languages(selected_url, is_playlist_temp)
-                    available_manual_langs = get_available_manual_languages(selected_url, is_playlist_temp)
+                    available_languages = get_available_subtitle_languages(selected_url, is_playlist_temp, cookies_file)
+                    available_manual_langs = get_available_manual_languages(selected_url, is_playlist_temp, cookies_file)
                     
                     if not available_languages:
                         st.info("No automatic captions detected. Defaulting to English.")
@@ -438,7 +468,10 @@ def main():
                 except ValueError as ve:
                     st.error(str(ve))
                 except Exception as e:
-                    st.error(f"Error validating URL: {str(e)}")
+                    if "Sign in to confirm" in str(e):
+                        st.error("YouTube requires sign-in to validate URL. Try uploading a cookies file or disabling VPN.")
+                    else:
+                        st.error(f"Error validating URL: {str(e)}")
         else:
             available_languages = ['en']
             available_manual_langs = ['en']
@@ -518,7 +551,7 @@ def main():
                     progress_container = st.empty()
                     progress_bar = progress_container.progress(0.0)
                     
-                    entries, _ = get_info(selected_url, is_playlist)
+                    entries, _ = get_info(selected_url, is_playlist, cookies_file)
                     total_videos = len(entries) or 1
 
                     output_dir, title, subtitle_files = download_subtitles(
@@ -531,13 +564,14 @@ def main():
                         progress_bar, 
                         total_videos, 
                         clean_transcript, 
-                        prefer_manual_only
+                        prefer_manual_only,
+                        cookies_file
                     )
 
                     progress_container.empty()
 
                     if not subtitle_files:
-                        st.error("No subtitles were downloaded from any videos. Please check if subtitles are available in the selected language(s), or try enabling auto-fallback.")
+                        st.error("No subtitles were downloaded. Try uploading a cookies file, disabling VPN, or checking if subtitles are available.")
                         return
 
                     st.success(f"Successfully downloaded {len(subtitle_files)} subtitle file(s)!")
@@ -579,7 +613,13 @@ def main():
                 except ValueError as ve:
                     st.error(str(ve))
                 except Exception as e:
-                    st.error(f"Error: {str(e)}")
+                    if "Sign in to confirm" in str(e):
+                        st.error("YouTube requires sign-in to process the request. Try uploading a cookies file or disabling VPN.")
+                    else:
+                        st.error(f"Error: {str(e)}")
+                finally:
+                    if cookies_file and os.path.exists(cookies_file):
+                        os.unlink(cookies_file)  # Clean up temporary cookies file
 
 if __name__ == "__main__":
     main()

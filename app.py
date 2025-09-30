@@ -9,7 +9,11 @@ from yt_dlp.utils import sanitize_filename
 import tempfile
 from io import BytesIO
 import time
+import logging
 from tenacity import retry, stop_after_attempt, wait_exponential
+
+# Set up logging for debugging
+logging.basicConfig(level=logging.DEBUG)
 
 # Language code to name mapping
 LANGUAGE_NAMES = {
@@ -130,7 +134,7 @@ def get_available_subtitle_languages(url, is_playlist, cookies_file=None):
         'no_check_certificate': True,
     }
     start_time = time.time()
-    timeout = 10  # seconds
+    timeout = 30  # Increased timeout
     with YoutubeDL(ydl_opts) as ydl:
         try:
             info = ydl.extract_info(url, download=False)
@@ -139,103 +143,43 @@ def get_available_subtitle_languages(url, is_playlist, cookies_file=None):
                 if first_video_id:
                     info = ydl.extract_info(f"https://www.youtube.com/watch?v={first_video_id}", download=False)
                 else:
-                    return []
+                    return ['all']
             
             if time.time() - start_time > timeout:
-                st.warning("Timeout fetching subtitle languages. Defaulting to English.")
-                return ['en']
+                st.warning("Timeout fetching subtitle languages. Defaulting to all languages.")
+                return ['all']
             
-            if 'automatic_captions' in info and info['automatic_captions']:
-                return list(info['automatic_captions'].keys())
-            
-            return []
-        except Exception as e:
-            if "Sign in to confirm" in str(e):
-                st.error("YouTube requires sign-in to access subtitle languages. Upload a cookies file (see instructions below) or disable VPN.")
-            else:
-                st.warning(f"Error fetching subtitle languages: {str(e)}. Defaulting to English.")
-            return ['en']
-
-@st.cache_data
-def get_available_manual_languages(url, is_playlist, cookies_file=None):
-    """Fetch available manual subtitle languages with timeout and retry."""
-    ydl_opts = {
-        'quiet': True,
-        'listsubtitles': True,
-        'no_warnings': True,
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        'cookiefile': cookies_file,
-        'restrict_filenames': True,
-        'no_check_certificate': True,
-    }
-    start_time = time.time()
-    timeout = 10  # seconds
-    with YoutubeDL(ydl_opts) as ydl:
-        try:
-            info = ydl.extract_info(url, download=False)
-            if is_playlist:
-                first_video_id = get_first_video_id(info)
-                if first_video_id:
-                    info = ydl.extract_info(f"https://www.youtube.com/watch?v={first_video_id}", download=False)
-                else:
-                    return []
-            
-            if time.time() - start_time > timeout:
-                st.warning("Timeout fetching manual subtitle languages. Defaulting to English.")
-                return ['en']
-            
+            languages = []
             if 'subtitles' in info and info['subtitles']:
-                return list(info['subtitles'].keys())
-            
-            return []
+                languages.extend(list(info['subtitles'].keys()))
+            if 'automatic_captions' in info and info['automatic_captions']:
+                languages.extend(list(info['automatic_captions'].keys()))
+            return list(set(languages)) or ['all']
         except Exception as e:
             if "Sign in to confirm" in str(e):
-                st.error("YouTube requires sign-in to access manual subtitles. Upload a cookies file (see instructions below) or disable VPN.")
+                st.error("YouTube requires sign-in to access subtitle languages. Upload a cookies file or disable VPN.")
             else:
-                st.warning(f"Error fetching manual subtitle languages: {str(e)}. Defaulting to English.")
-            return ['en']
+                st.warning(f"Error fetching subtitle languages: {str(e)}. Defaulting to all languages.")
+            return ['all']
 
-def find_subtitle_file(base_path, lang_list, format_choice):
-    """Find subtitle file for any of the selected languages."""
-    if not isinstance(lang_list, list):
-        lang_list = [lang_list]
-    
-    selected_language = None
-    for lang in lang_list:
-        lang_variants = [lang]
-        if '-' not in lang:
-            lang_variants.append(f"{lang}-orig")
-        elif lang.endswith('-orig'):
-            lang_variants.append(lang.replace('-orig', ''))
-        
-        patterns = []
-        for variant in lang_variants:
-            patterns.extend([
-                f"{base_path}.{variant}.{format_choice}",
-                f"{base_path}.{variant}.auto.{format_choice}",
-                f"{base_path}.{variant}.srt",
-                f"{base_path}.{variant}.auto.srt",
-                f"{base_path}.{variant}.vtt",
-                f"{base_path}.{variant}.auto.vtt",
-            ])
-        
-        for pattern in patterns:
-            matches = glob.glob(pattern)
-            if matches:
-                selected_language = lang
-                return matches[0], selected_language
-    
-    wildcard_patterns = [
+def find_subtitle_file(base_path, format_choice):
+    """Find subtitle file for any available language."""
+    patterns = [
         f"{base_path}.*.{format_choice}",
+        f"{base_path}.*.auto.{format_choice}",
         f"{base_path}.*.srt",
+        f"{base_path}.*.auto.srt",
         f"{base_path}.*.vtt",
+        f"{base_path}.*.auto.vtt",
     ]
-    for pattern in wildcard_patterns:
+    logging.debug(f"Searching for subtitle files with patterns: {patterns}")
+    for pattern in patterns:
         matches = glob.glob(pattern)
         if matches:
-            selected_language = matches[0].split('.')[-2]
+            selected_language = matches[0].split('.')[-2].split('.auto')[0]
+            logging.debug(f"Found subtitle file: {matches[0]} for language: {selected_language}")
             return matches[0], selected_language
-    
+    logging.warning(f"No subtitle files found for base_path: {base_path}")
     return None, None
 
 def convert_vtt_to_srt(vtt_path):
@@ -314,14 +258,12 @@ def create_zip(subtitle_files, title):
     return zip_buffer, f"{safe_title}_subtitles.zip"
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=5))
-def download_subtitles(url, sub_type, lang, format_choice, temp_dir, is_playlist, progress_bar, total_videos, clean_transcript, prefer_manual_only, cookies_file=None):
-    """Download subtitles for video or playlist with retry."""
-    lang_list = lang if isinstance(lang, list) else [lang]
-    
+def download_subtitles(url, format_choice, temp_dir, is_playlist, progress_bar, total_videos, clean_transcript, cookies_file=None):
+    """Download all available subtitles for video or playlist with retry."""
     ydl_opts = {
         'writesubtitles': True,
-        'writeautomaticsub': sub_type == 'auto' or not prefer_manual_only,
-        'subtitleslangs': lang_list,
+        'writeautomaticsub': True,
+        'subtitleslangs': ['all'],
         'subtitlesformat': 'vtt' if format_choice == 'vtt' else 'srt',
         'skip_download': True,
         'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
@@ -342,7 +284,7 @@ def download_subtitles(url, sub_type, lang, format_choice, temp_dir, is_playlist
             return temp_dir, title, subtitle_files
     except Exception as e:
         if "Sign in to confirm" in str(e):
-            st.error("YouTube requires sign-in to access video info. Upload a cookies file (see instructions below) or disable VPN.")
+            st.error("YouTube requires sign-in to access video info. Upload a cookies file or disable VPN.")
         else:
             st.error(f"Error fetching video info: {str(e)}")
         return temp_dir, "unknown", []
@@ -363,9 +305,10 @@ def download_subtitles(url, sub_type, lang, format_choice, temp_dir, is_playlist
             video_url = f"https://www.youtube.com/watch?v={video_id}" if is_playlist else url
             sanitized_title = sanitize_filename(video_title)[:150]
             base_path = os.path.join(temp_dir, sanitized_title)
+            logging.debug(f"Downloading subtitles for {video_url}, base_path: {base_path}")
             
             start_time = time.time()
-            timeout = 10  # seconds
+            timeout = 30  # Increased timeout
             with YoutubeDL(ydl_opts) as ydl:
                 ydl.download([video_url])
             
@@ -374,7 +317,7 @@ def download_subtitles(url, sub_type, lang, format_choice, temp_dir, is_playlist
                 progress_bar.progress((i + 1) / total_videos)
                 continue
             
-            sub_path, selected_language = find_subtitle_file(base_path, lang_list, format_choice)
+            sub_path, selected_language = find_subtitle_file(base_path, format_choice)
             
             if sub_path:
                 if format_choice == 'txt':
@@ -394,11 +337,11 @@ def download_subtitles(url, sub_type, lang, format_choice, temp_dir, is_playlist
                 if selected_language:
                     st.info(f"Downloaded subtitles for '{video_title}' in {format_language_option(selected_language)}")
             else:
-                st.warning(f"No subtitles found for '{video_title}' in language(s): {', '.join(format_language_option(code) for code in lang_list)}")
+                st.warning(f"No subtitles found for '{video_title}'")
         
         except Exception as e:
             if "Sign in to confirm" in str(e):
-                st.error(f"YouTube requires sign-in for '{video_title}' ({video_id}). Upload a cookies file (see instructions below) or disable VPN.")
+                st.error(f"YouTube requires sign-in for '{video_title}' ({video_id}). Upload a cookies file or disable VPN.")
             else:
                 st.warning(f"Error downloading subtitles for '{video_title}': {str(e)}")
             progress_bar.progress((i + 1) / total_videos)
@@ -440,99 +383,6 @@ def main():
                 tmp_file.write(uploaded_file.read())
                 cookies_file = tmp_file.name
         
-        sub_type = st.selectbox(
-            "Subtitle Type", 
-            ["Original (all languages)", "Auto-translate"], 
-            help="Original: Manual subtitles (with auto-fallback if enabled); Auto-translate: Automatic captions/translations."
-        )
-        
-        lang = ['en']
-        lang_codes = ['en']
-        prefer_manual_only = False
-        download_scope = 'Entire Playlist'
-        available_languages = []
-        available_manual_langs = []
-        
-        if st.button("Clear Language Cache"):
-            get_available_subtitle_languages.clear()
-            get_available_manual_languages.clear()
-            st.info("Language cache cleared. Re-enter the URL to refresh available languages.")
-        
-        if url:
-            with st.spinner("Validating URL and fetching languages..."):
-                try:
-                    corrected_playlist_url, corrected_video_url, url_type = validate_url(url)
-                    
-                    if url_type == 'both':
-                        download_scope = st.selectbox(
-                            "Download Scope", 
-                            ["Entire Playlist", "Single Video"], 
-                            help="Choose whether to download for the playlist or just the video in the URL", 
-                            key="download_scope"
-                        )
-                    
-                    selected_url = corrected_playlist_url if url_type == 'playlist' or (url_type == 'both' and download_scope == 'Entire Playlist') else corrected_video_url
-                    is_playlist_temp = url_type == 'playlist' or (url_type == 'both' and download_scope == 'Entire Playlist')
-                    
-                    available_languages = get_available_subtitle_languages(selected_url, is_playlist_temp, cookies_file)
-                    available_manual_langs = get_available_manual_languages(selected_url, is_playlist_temp, cookies_file)
-                    
-                    if not available_languages:
-                        st.info("No automatic captions detected. Defaulting to English.")
-                        available_languages = ['en']
-                    if not available_manual_langs:
-                        st.info("No manual subtitles detected. Defaulting to English.")
-                        available_manual_langs = ['en']
-                
-                except ValueError as ve:
-                    st.error(str(ve))
-                except Exception as e:
-                    if "Sign in to confirm" in str(e):
-                        st.error("YouTube requires sign-in to validate URL. Upload a cookies file (see instructions above) or disable VPN.")
-                    else:
-                        st.error(f"Error validating URL: {str(e)}")
-        else:
-            available_languages = ['en']
-            available_manual_langs = ['en']
-        
-        if sub_type == 'Original (all languages)':
-            lang_options = {format_language_option(code): code for code in available_manual_langs}
-            default_display = format_language_option('tr' if 'tr' in available_manual_langs else available_manual_langs[0])
-            
-            selected_display = st.multiselect(
-                "Select Original Languages", 
-                list(lang_options.keys()), 
-                default=[default_display], 
-                help="Select languages; first available language per video will be used. Auto-fallback included unless disabled."
-            )
-            
-            lang_codes = [lang_options[display] for display in selected_display]
-            if not lang_codes:
-                st.warning("No language selected. Defaulting to English.")
-                lang_codes = ['en']
-            
-            prefer_manual_only = st.checkbox(
-                "Prefer Manual Only (No Auto-Fallback)", 
-                value=False, 
-                help="Disable auto-generated subs if manual ones are missing."
-            )
-        else:
-            lang_options = {format_language_option(code): code for code in available_languages}
-            default_index = 0
-            if available_languages and 'tr' in available_languages:
-                default_display = format_language_option('tr')
-                if default_display in lang_options:
-                    default_index = list(lang_options.keys()).index(default_display)
-            
-            selected_display = st.selectbox(
-                "Auto-translate Language", 
-                list(lang_options.keys()), 
-                index=default_index, 
-                help="Select a language for auto-translated subtitles"
-            )
-            
-            lang_codes = lang_options[selected_display]
-
         format_choice = st.selectbox(
             "Format", 
             ["srt", "vtt", "txt"], 
@@ -546,12 +396,30 @@ def main():
         )
         
         combine_choice = None
-        if url and 'list' in url and download_scope != "Single Video":
-            combine_choice = st.selectbox(
-                "Output Style", 
-                ["separate", "combined"], 
-                help="Separate: Individual files in ZIP; Combined: Single file."
-            )
+        download_scope = 'Entire Playlist'
+        if url:
+            try:
+                corrected_playlist_url, corrected_video_url, url_type = validate_url(url)
+                if url_type == 'both':
+                    download_scope = st.selectbox(
+                        "Download Scope", 
+                        ["Entire Playlist", "Single Video"], 
+                        help="Choose whether to download for the playlist or just the video in the URL", 
+                        key="download_scope"
+                    )
+                if url_type == 'playlist' or (url_type == 'both' and download_scope == 'Entire Playlist'):
+                    combine_choice = st.selectbox(
+                        "Output Style", 
+                        ["separate", "combined"], 
+                        help="Separate: Individual files in ZIP; Combined: Single file."
+                    )
+            except ValueError as ve:
+                st.error(str(ve))
+            except Exception as e:
+                if "Sign in to confirm" in str(e):
+                    st.error("YouTube requires sign-in to validate URL. Upload a cookies file or disable VPN.")
+                else:
+                    st.error(f"Error validating URL: {str(e)}")
 
     if st.button("Download Subtitles", type="primary"):
         if not url:
@@ -575,15 +443,12 @@ def main():
 
                     output_dir, title, subtitle_files = download_subtitles(
                         selected_url, 
-                        'auto' if 'Auto' in sub_type else 'original', 
-                        lang_codes, 
                         format_choice, 
                         temp_dir, 
                         is_playlist, 
                         progress_bar, 
                         total_videos, 
                         clean_transcript, 
-                        prefer_manual_only,
                         cookies_file
                     )
 
@@ -633,7 +498,7 @@ def main():
                     st.error(str(ve))
                 except Exception as e:
                     if "Sign in to confirm" in str(e):
-                        st.error("YouTube requires sign-in to process the request. Upload a cookies file (see instructions above) or disable VPN.")
+                        st.error("YouTube requires sign-in to process the request. Upload a cookies file or disable VPN.")
                     else:
                         st.error(f"Error: {str(e)}")
                 finally:

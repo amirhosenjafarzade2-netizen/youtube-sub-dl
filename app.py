@@ -8,6 +8,7 @@ from yt_dlp import YoutubeDL
 from yt_dlp.utils import sanitize_filename
 import tempfile
 from io import BytesIO
+import time
 
 # Language code to name mapping
 LANGUAGE_NAMES = {
@@ -53,34 +54,37 @@ def format_language_option(code):
 
 def validate_url(url):
     """Validate and classify the URL, return corrected URL, type, and video ID if present."""
-    parsed_url = urlparse(url)
-    
-    if parsed_url.netloc == 'youtu.be':
-        video_id = parsed_url.path.lstrip('/')
+    try:
+        parsed_url = urlparse(url)
+        
+        if parsed_url.netloc == 'youtu.be':
+            video_id = parsed_url.path.lstrip('/')
+            query_params = parse_qs(parsed_url.query)
+            playlist_id = query_params.get('list', [None])[0]
+            
+            if playlist_id and video_id:
+                return (f"https://www.youtube.com/playlist?list={playlist_id}", 
+                        f"https://www.youtube.com/watch?v={video_id}", 
+                        'both')
+            elif video_id:
+                return (f"https://www.youtube.com/watch?v={video_id}", None, 'video')
+        
         query_params = parse_qs(parsed_url.query)
+        video_id = query_params.get('v', [None])[0]
         playlist_id = query_params.get('list', [None])[0]
         
         if playlist_id and video_id:
             return (f"https://www.youtube.com/playlist?list={playlist_id}", 
                     f"https://www.youtube.com/watch?v={video_id}", 
                     'both')
+        elif playlist_id:
+            return (f"https://www.youtube.com/playlist?list={playlist_id}", None, 'playlist')
         elif video_id:
             return (f"https://www.youtube.com/watch?v={video_id}", None, 'video')
-    
-    query_params = parse_qs(parsed_url.query)
-    video_id = query_params.get('v', [None])[0]
-    playlist_id = query_params.get('list', [None])[0]
-    
-    if playlist_id and video_id:
-        return (f"https://www.youtube.com/playlist?list={playlist_id}", 
-                f"https://www.youtube.com/watch?v={video_id}", 
-                'both')
-    elif playlist_id:
-        return (f"https://www.youtube.com/playlist?list={playlist_id}", None, 'playlist')
-    elif video_id:
-        return (f"https://www.youtube.com/watch?v={video_id}", None, 'video')
-    else:
-        raise ValueError("Invalid YouTube URL. Please provide a video or playlist URL.")
+        else:
+            raise ValueError("Invalid YouTube URL. Please provide a video or playlist URL.")
+    except Exception as e:
+        raise ValueError(f"Error parsing URL: {str(e)}")
 
 def get_first_video_id(info):
     """Helper to extract first video ID from playlist info."""
@@ -96,56 +100,83 @@ def get_info(url, is_playlist):
         'no_warnings': True,
     }
     with YoutubeDL(ydl_opts) as ydl:
-        result = ydl.extract_info(url, download=False)
-        if is_playlist:
-            if 'entries' not in result or not result['entries']:
-                raise Exception("No videos found in playlist.")
-            return result['entries'], result.get('title', 'playlist_subtitles')
-        else:
-            return [result], result.get('title', 'video_subtitles')
+        try:
+            result = ydl.extract_info(url, download=False)
+            if is_playlist:
+                if 'entries' not in result or not result['entries']:
+                    raise Exception("No videos found in playlist.")
+                return result['entries'], result.get('title', 'playlist_subtitles')
+            else:
+                return [result], result.get('title', 'video_subtitles')
+        except Exception as e:
+            raise Exception(f"Error fetching info: {str(e)}")
 
 @st.cache_data
 def get_available_subtitle_languages(url, is_playlist):
-    """Fetch available subtitle languages for the video or first video in playlist."""
+    """Fetch available subtitle languages with timeout."""
     ydl_opts = {
         'quiet': True,
         'listsubtitles': True,
         'no_warnings': True,
     }
+    start_time = time.time()
+    timeout = 10  # seconds
     with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-        if is_playlist:
-            first_video_id = get_first_video_id(info)
-            if first_video_id:
-                info = ydl.extract_info(f"https://www.youtube.com/watch?v={first_video_id}", download=False)
-        
-        if 'automatic_captions' in info and info['automatic_captions']:
-            return list(info['automatic_captions'].keys())
-        
-        return []
+        try:
+            info = ydl.extract_info(url, download=False)
+            if is_playlist:
+                first_video_id = get_first_video_id(info)
+                if first_video_id:
+                    info = ydl.extract_info(f"https://www.youtube.com/watch?v={first_video_id}", download=False)
+                else:
+                    return []
+            
+            if time.time() - start_time > timeout:
+                st.warning("Timeout fetching subtitle languages. Defaulting to English.")
+                return ['en']
+            
+            if 'automatic_captions' in info and info['automatic_captions']:
+                return list(info['automatic_captions'].keys())
+            
+            return []
+        except Exception as e:
+            st.warning(f"Error fetching subtitle languages: {str(e)}. Defaulting to English.")
+            return ['en']
 
 @st.cache_data
 def get_available_manual_languages(url, is_playlist):
-    """Fetch available manual subtitle languages."""
+    """Fetch available manual subtitle languages with timeout."""
     ydl_opts = {
         'quiet': True,
         'listsubtitles': True,
         'no_warnings': True,
     }
+    start_time = time.time()
+    timeout = 10  # seconds
     with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-        if is_playlist:
-            first_video_id = get_first_video_id(info)
-            if first_video_id:
-                info = ydl.extract_info(f"https://www.youtube.com/watch?v={first_video_id}", download=False)
-        
-        if 'subtitles' in info and info['subtitles']:
-            return list(info['subtitles'].keys())
-        
-        return []
+        try:
+            info = ydl.extract_info(url, download=False)
+            if is_playlist:
+                first_video_id = get_first_video_id(info)
+                if first_video_id:
+                    info = ydl.extract_info(f"https://www.youtube.com/watch?v={first_video_id}", download=False)
+                else:
+                    return []
+            
+            if time.time() - start_time > timeout:
+                st.warning("Timeout fetching manual subtitle languages. Defaulting to English.")
+                return ['en']
+            
+            if 'subtitles' in info and info['subtitles']:
+                return list(info['subtitles'].keys())
+            
+            return []
+        except Exception as e:
+            st.warning(f"Error fetching manual subtitle languages: {str(e)}. Defaulting to English.")
+            return ['en']
 
 def find_subtitle_file(base_path, lang_list, format_choice):
-    """Find subtitle file for any of the selected languages, checking various extensions and variants."""
+    """Find subtitle file for any of the selected languages."""
     if not isinstance(lang_list, list):
         lang_list = [lang_list]
     
@@ -182,7 +213,7 @@ def find_subtitle_file(base_path, lang_list, format_choice):
     for pattern in wildcard_patterns:
         matches = glob.glob(pattern)
         if matches:
-            selected_language = matches[0].split('.')[-2]  # Extract language code
+            selected_language = matches[0].split('.')[-2]
             return matches[0], selected_language
     
     return None, None
@@ -278,7 +309,14 @@ def download_subtitles(url, sub_type, lang, format_choice, temp_dir, is_playlist
     }
     
     subtitle_files = []
-    entries, title = get_info(url, is_playlist)
+    try:
+        entries, title = get_info(url, is_playlist)
+        if not entries:
+            st.error("No videos found in the provided URL.")
+            return temp_dir, title, subtitle_files
+    except Exception as e:
+        st.error(f"Error fetching video info: {str(e)}")
+        return temp_dir, "unknown", []
     
     for i, entry in enumerate(entries):
         video_title = entry.get('title', f'video_{i+1}')
@@ -297,8 +335,15 @@ def download_subtitles(url, sub_type, lang, format_choice, temp_dir, is_playlist
             sanitized_title = sanitize_filename(video_title)[:150]
             base_path = os.path.join(temp_dir, sanitized_title)
             
+            start_time = time.time()
+            timeout = 10  # seconds
             with YoutubeDL(ydl_opts) as ydl:
                 ydl.download([video_url])
+            
+            if time.time() - start_time > timeout:
+                st.warning(f"Timeout downloading subtitles for '{video_title}'. Skipping.")
+                progress_bar.progress((i + 1) / total_videos)
+                continue
             
             sub_path, selected_language = find_subtitle_file(base_path, lang_list, format_choice)
             
@@ -365,34 +410,35 @@ def main():
             st.info("Language cache cleared. Re-enter the URL to refresh available languages.")
         
         if url:
-            try:
-                corrected_playlist_url, corrected_video_url, url_type = validate_url(url)
+            with st.spinner("Validating URL and fetching languages..."):
+                try:
+                    corrected_playlist_url, corrected_video_url, url_type = validate_url(url)
+                    
+                    if url_type == 'both':
+                        download_scope = st.selectbox(
+                            "Download Scope", 
+                            ["Entire Playlist", "Single Video"], 
+                            help="Choose whether to download for the playlist or just the video in the URL", 
+                            key="download_scope"
+                        )
+                    
+                    selected_url = corrected_playlist_url if url_type == 'playlist' or (url_type == 'both' and download_scope == 'Entire Playlist') else corrected_video_url
+                    is_playlist_temp = url_type == 'playlist' or (url_type == 'both' and download_scope == 'Entire Playlist')
+                    
+                    available_languages = get_available_subtitle_languages(selected_url, is_playlist_temp)
+                    available_manual_langs = get_available_manual_languages(selected_url, is_playlist_temp)
+                    
+                    if not available_languages:
+                        st.info("No automatic captions detected. Defaulting to English.")
+                        available_languages = ['en']
+                    if not available_manual_langs:
+                        st.info("No manual subtitles detected. Defaulting to English.")
+                        available_manual_langs = ['en']
                 
-                if url_type == 'both':
-                    download_scope = st.selectbox(
-                        "Download Scope", 
-                        ["Entire Playlist", "Single Video"], 
-                        help="Choose whether to download for the playlist or just the video in the URL", 
-                        key="download_scope"
-                    )
-                
-                selected_url = corrected_playlist_url if url_type == 'playlist' or (url_type == 'both' and download_scope == 'Entire Playlist') else corrected_video_url
-                is_playlist_temp = url_type == 'playlist' or (url_type == 'both' and download_scope == 'Entire Playlist')
-                
-                available_languages = get_available_subtitle_languages(selected_url, is_playlist_temp)
-                available_manual_langs = get_available_manual_languages(selected_url, is_playlist_temp)
-                
-                if not available_languages:
-                    st.info("No automatic captions detected. Defaulting to English.")
-                    available_languages = ['en']
-                if not available_manual_langs:
-                    st.info("No manual subtitles detected. Defaulting to English.")
-                    available_manual_langs = ['en']
-            
-            except ValueError as ve:
-                st.error(str(ve))
-            except Exception as e:
-                st.error(f"Error validating URL: {str(e)}")
+                except ValueError as ve:
+                    st.error(str(ve))
+                except Exception as e:
+                    st.error(f"Error validating URL: {str(e)}")
         else:
             available_languages = ['en']
             available_manual_langs = ['en']
@@ -460,79 +506,80 @@ def main():
             st.error("Please enter a YouTube URL.")
             return
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            try:
-                corrected_playlist_url, corrected_video_url, url_type = validate_url(url)
-                is_playlist = url_type == 'playlist' or (url_type == 'both' and download_scope == "Entire Playlist")
-                selected_url = corrected_playlist_url if is_playlist else corrected_video_url
-                
-                st.info(f"Detected: {'Playlist' if is_playlist else 'Single Video'} - Using URL: {selected_url}")
+        with st.spinner("Downloading subtitles..."):
+            with tempfile.TemporaryDirectory() as temp_dir:
+                try:
+                    corrected_playlist_url, corrected_video_url, url_type = validate_url(url)
+                    is_playlist = url_type == 'playlist' or (url_type == 'both' and download_scope == "Entire Playlist")
+                    selected_url = corrected_playlist_url if is_playlist else corrected_video_url
+                    
+                    st.info(f"Detected: {'Playlist' if is_playlist else 'Single Video'} - Using URL: {selected_url}")
 
-                progress_container = st.empty()
-                progress_bar = progress_container.progress(0.0)
-                
-                entries, _ = get_info(selected_url, is_playlist)
-                total_videos = len(entries) or 1
+                    progress_container = st.empty()
+                    progress_bar = progress_container.progress(0.0)
+                    
+                    entries, _ = get_info(selected_url, is_playlist)
+                    total_videos = len(entries) or 1
 
-                output_dir, title, subtitle_files = download_subtitles(
-                    selected_url, 
-                    'auto' if 'Auto' in sub_type else 'original', 
-                    lang_codes, 
-                    format_choice, 
-                    temp_dir, 
-                    is_playlist, 
-                    progress_bar, 
-                    total_videos, 
-                    clean_transcript, 
-                    prefer_manual_only
-                )
-
-                progress_container.empty()
-
-                if not subtitle_files:
-                    st.error("No subtitles were downloaded from any videos. Please check if subtitles are available in the selected language(s), or try enabling auto-fallback.")
-                    return
-
-                st.success(f"Successfully downloaded {len(subtitle_files)} subtitle file(s)!")
-
-                mime_type = get_mime_type(format_choice)
-
-                if is_playlist and combine_choice == 'combined':
-                    combined_file = combine_subtitles(subtitle_files, output_dir, title, format_choice)
-                    with open(combined_file, 'rb') as f:
-                        file_data = f.read()
-                    st.download_button(
-                        "Download Combined File", 
-                        file_data, 
-                        file_name=os.path.basename(combined_file), 
-                        mime=mime_type
+                    output_dir, title, subtitle_files = download_subtitles(
+                        selected_url, 
+                        'auto' if 'Auto' in sub_type else 'original', 
+                        lang_codes, 
+                        format_choice, 
+                        temp_dir, 
+                        is_playlist, 
+                        progress_bar, 
+                        total_videos, 
+                        clean_transcript, 
+                        prefer_manual_only
                     )
-                elif is_playlist and combine_choice == 'separate':
-                    zip_buffer, zip_name = create_zip(subtitle_files, title)
-                    st.download_button(
-                        "Download ZIP", 
-                        zip_buffer, 
-                        file_name=zip_name, 
-                        mime="application/zip"
-                    )
-                else:
-                    if subtitle_files:
-                        _, sub_path = subtitle_files[0]
-                        with open(sub_path, 'rb') as f:
+
+                    progress_container.empty()
+
+                    if not subtitle_files:
+                        st.error("No subtitles were downloaded from any videos. Please check if subtitles are available in the selected language(s), or try enabling auto-fallback.")
+                        return
+
+                    st.success(f"Successfully downloaded {len(subtitle_files)} subtitle file(s)!")
+
+                    mime_type = get_mime_type(format_choice)
+
+                    if is_playlist and combine_choice == 'combined':
+                        combined_file = combine_subtitles(subtitle_files, output_dir, title, format_choice)
+                        with open(combined_file, 'rb') as f:
                             file_data = f.read()
                         st.download_button(
-                            "Download Subtitle File", 
+                            "Download Combined File", 
                             file_data, 
-                            file_name=os.path.basename(sub_path), 
+                            file_name=os.path.basename(combined_file), 
                             mime=mime_type
                         )
+                    elif is_playlist and combine_choice == 'separate':
+                        zip_buffer, zip_name = create_zip(subtitle_files, title)
+                        st.download_button(
+                            "Download ZIP", 
+                            zip_buffer, 
+                            file_name=zip_name, 
+                            mime="application/zip"
+                        )
                     else:
-                        st.error("Unexpected error: No subtitle files available.")
+                        if subtitle_files:
+                            _, sub_path = subtitle_files[0]
+                            with open(sub_path, 'rb') as f:
+                                file_data = f.read()
+                            st.download_button(
+                                "Download Subtitle File", 
+                                file_data, 
+                                file_name=os.path.basename(sub_path), 
+                                mime=mime_type
+                            )
+                        else:
+                            st.error("Unexpected error: No subtitle files available.")
 
-            except ValueError as ve:
-                st.error(str(ve))
-            except Exception as e:
-                st.error(f"Error: {str(e)}")
+                except ValueError as ve:
+                    st.error(str(ve))
+                except Exception as e:
+                    st.error(f"Error: {str(e)}")
 
 if __name__ == "__main__":
     main()

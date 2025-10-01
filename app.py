@@ -12,8 +12,8 @@ import time
 import logging
 from tenacity import retry, stop_after_attempt, wait_exponential
 import requests
-from bs4 import BeautifulSoup
-import json
+from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound, CouldNotRetrieveTranscript
+from youtube_transcript_api.formatters import SRTFormatter, WebVTTFormatter
 
 # Set up logging for debugging
 logging.basicConfig(level=logging.DEBUG)
@@ -101,48 +101,65 @@ def extract_video_id(url):
         return parsed.path.lstrip('/')
     return parse_qs(parsed.query).get('v', [None])[0]
 
-def get_caption_tracks(video_id):
-    """Fetch video page and parse for available caption tracks (manual + auto-generated)."""
-    url = f"https://www.youtube.com/watch?v={video_id}"
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Referer': 'https://www.youtube.com/',
-        'Accept-Language': 'en-US,en;q=0.9',
-    }
-    response = requests.get(url, headers=headers)
-    if response.status_code != 200:
-        raise ValueError(f"Failed to fetch video page: {response.status_code}")
-    
-    # Parse ytInitialPlayerResponse from JS
-    soup = BeautifulSoup(response.text, 'html.parser')
-    scripts = soup.find_all('script')
-    for script in scripts:
-        if script.string and 'ytInitialPlayerResponse' in script.string:
-            match = re.search(r'ytInitialPlayerResponse\s*=\s*({.+?});', script.string, re.DOTALL)
-            if match:
-                data = json.loads(match.group(1))
-                captions = data.get('captions', {}).get('playerCaptionsTracklistRenderer', {}).get('captionTracks', [])
-                audio_tracks = data.get('captions', {}).get('asrTrack', []) if data.get('captions') else []
-                return captions + audio_tracks  # Returns list of dicts with 'baseUrl', 'languageCode', 'name'
-    raise ValueError("No caption tracks found (manual or auto-generated)")
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+def get_transcript(video_id, format_choice='srt'):
+    """Fetch transcript using youtube-transcript-api (manual + auto-generated)."""
+    try:
+        # Get available transcripts
+        transcripts = YouTubeTranscriptApi.list_transcripts(video_id)
+        transcript_list = []
 
-def fetch_subtitle(base_url, fmt='srt'):
-    """Fetch subtitle from timedtext API (supports auto-generated)."""
-    url = f"{base_url}&fmt={fmt}"
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Referer': 'https://www.youtube.com/',
-    }
-    response = requests.get(url, headers=headers)
-    if response.status_code == 200:
-        return response.text
-    raise ValueError(f"Failed to fetch subtitle: {response.status_code}")
+        # Prioritize manual English
+        try:
+            transcript = transcripts.find_generated_transcript(['en'])  # Auto-generated
+            if transcript:
+                transcript_list.append((transcript.fetch(), 'en', True))  # True for auto
+        except TranscriptsDisabled:
+            pass
+        except NoTranscriptFound:
+            pass
+
+        # Manual fallback
+        try:
+            transcript = transcripts.find_transcript(['en'])
+            if transcript:
+                transcript_list.append((transcript.fetch(), 'en', False))  # False for manual
+        except TranscriptsDisabled:
+            pass
+        except NoTranscriptFound:
+            pass
+
+        if not transcript_list:
+            # Try any language
+            transcript = transcripts.find_transcript(transcripts)
+            transcript_list.append((transcript.fetch(), transcript.language_code, False))
+
+        # Use first available (prioritized)
+        transcript_data, lang_code, is_auto = transcript_list[0]
+
+        # Format to desired output
+        if format_choice == 'srt':
+            formatter = SRTFormatter()
+        elif format_choice == 'vtt':
+            formatter = WebVTTFormatter()
+        else:  # txt fallback to SRT then strip
+            formatter = SRTFormatter()
+            format_choice = 'srt'  # Temp
+
+        sub_text = formatter.format_transcript(transcript_data)
+
+        return sub_text, lang_code, is_auto
+
+    except CouldNotRetrieveTranscript as e:
+        raise ValueError(f"Could not retrieve transcript: {str(e)}")
+    except Exception as e:
+        raise ValueError(f"Error fetching transcript: {str(e)}")
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def get_info(url, is_playlist=False, cookies_file=None):
-    """Get subtitle tracks for video or playlist IDs."""
+    """Get video IDs and titles for playlist or single video."""
     if is_playlist:
-        # Light yt-dlp for playlist entries only
+        # Light yt-dlp for playlist entries
         ydl_opts = {
             'extract_flat': True,
             'quiet': True,
@@ -154,51 +171,43 @@ def get_info(url, is_playlist=False, cookies_file=None):
             result = ydl.extract_info(url, download=False)
             entries = result.get('entries', [])
             video_ids = [entry.get('id') for entry in entries if entry.get('id')]
+            titles = [entry.get('title', f'video_{i+1}') for i, entry in enumerate(entries) if entry.get('id')]
             title = result.get('title', 'playlist_subtitles')
-            return [{'id': vid} for vid in video_ids], title
+            return list(zip(video_ids, titles)), title
     else:
         video_id = extract_video_id(url)
         if not video_id:
             raise ValueError("Invalid video URL")
-        tracks = get_caption_tracks(video_id)
-        # Fetch title from page
-        title_url = f"https://www.youtube.com/watch?v={video_id}"
-        title_response = requests.get(title_url, headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'})
-        title_match = re.search(r'"title":"([^"]+)"', title_response.text)
-        title = title_match.group(1).replace('\\u0027', "'") if title_match else 'video_subtitles'
-        return [{'id': video_id, 'tracks': tracks}], title
+        # Fetch title via yt-dlp light extract
+        ydl_opts = {'quiet': True, 'no_warnings': True}
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            title = info.get('title', 'video_subtitles')
+        return [(video_id, title)], title
 
-def convert_vtt_to_srt(vtt_path):
-    """Convert VTT to SRT format with proper timestamp conversion."""
-    srt_path = vtt_path.rsplit('.', 1)[0] + '.srt'
-    with open(vtt_path, 'r', encoding='utf-8') as vtt_file, open(srt_path, 'w', encoding='utf-8') as srt_file:
-        for line in vtt_file:
-            if line.strip() == 'WEBVTT' or line.startswith('Kind:') or line.startswith('Language:'):
-                continue
-            line = re.sub(r'(\d{2}:\d{2}:\d{2})\.(\d{3})', r'\1,\2', line)
-            srt_file.write(line)
-    return srt_path
-
-def convert_srt_to_txt(srt_path):
-    """Convert SRT to plain TXT by stripping timestamps, numbers, and inline tags."""
-    txt_path = srt_path.rsplit('.', 1)[0] + '.txt'
-    with open(srt_path, 'r', encoding='utf-8') as srt_file, open(txt_path, 'w', encoding='utf-8') as txt_file:
-        for line in srt_file:
-            if re.match(r'^\d+$', line.strip()) or re.match(r'^\d{2}:\d{2}:\d{2}[,\.]\d{3} --> \d{2}:\d{2}:\d{2}[,\.]\d{3}$', line.strip()):
-                continue
-            line = re.sub(r'<[\d:.]+>', '', line)
-            line = re.sub(r'</?c[^>]*>', '', line)
-            line = re.sub(r'</?v[^>]*>', '', line)
-            if line.strip():
-                txt_file.write(line.strip() + '\n')
-        txt_file.write('\n')
-    return txt_path
+def convert_srt_to_txt(srt_text):
+    """Convert SRT text to plain TXT by stripping timestamps, numbers, and inline tags."""
+    lines = srt_text.split('\n')
+    txt_lines = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if re.match(r'^\d+$', line) or re.match(r'^\d{2}:\d{2}:\d{2}[,\.]\d{3} --> \d{2}:\d{2}:\d{2}[,\.]\d{3}$', line):
+            i += 1
+            continue
+        line = re.sub(r'<[\d:.]+>', '', line)
+        line = re.sub(r'</?c[^>]*>', '', line)
+        line = re.sub(r'</?v[^>]*>', '', line)
+        if line:
+            txt_lines.append(line)
+        i += 1
+    return '\n'.join(txt_lines) + '\n'
 
 def clean_subtitle_text(text):
     """Clean subtitle text: Remove ads, extra newlines, etc."""
-    text = re.sub(r'\[Advertisement\].*?\n', '', text, flags=re.DOTALL)
+    text = re.sub(r'\[Advertisement\].*?\n', '', text, flags=re.DOTALL | re.IGNORECASE)
     text = re.sub(r'\n{3,}', '\n\n', text)
-    return text
+    return text.strip()
 
 def combine_subtitles(subtitle_files, output_dir, title, format_choice):
     """Combine subtitles into a single file."""
@@ -208,44 +217,42 @@ def combine_subtitles(subtitle_files, output_dir, title, format_choice):
     cue_index = 1
     
     with open(combined_file, 'w', encoding='utf-8') as outfile:
-        for video_title, sub_path in subtitle_files:
+        for video_title, sub_text in subtitle_files:
             if format_choice != 'txt':
                 outfile.write(f"\n\n=== {video_title} ===\n\n")
             else:
                 outfile.write(f"\n\n### {video_title} ###\n\n")
             
             if format_choice in ['srt', 'vtt']:
-                with open(sub_path, 'r', encoding='utf-8') as infile:
-                    content = infile.read()
-                    lines = content.split('\n')
-                    i = 0
-                    while i < len(lines):
-                        line = lines[i].strip()
-                        if re.match(r'^\d+$', line):
-                            outfile.write(f"{cue_index}\n")
-                            cue_index += 1
-                        else:
-                            outfile.write(lines[i] + '\n')
-                        i += 1
+                lines = sub_text.split('\n')
+                i = 0
+                while i < len(lines):
+                    line = lines[i].strip()
+                    if re.match(r'^\d+$', line):
+                        outfile.write(f"{cue_index}\n")
+                        cue_index += 1
+                    else:
+                        outfile.write(lines[i] + '\n')
+                    i += 1
             else:
-                with open(sub_path, 'r', encoding='utf-8') as infile:
-                    outfile.write(infile.read())
+                outfile.write(sub_text + '\n')
     
     return combined_file
 
 def create_zip(subtitle_files, title):
-    """Create zip for separate files."""
+    """Create zip for separate files (now using text in memory)."""
     zip_buffer = BytesIO()
     safe_title = sanitize_filename(title)[:150]
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
-        for _, sub_path in subtitle_files:
-            zipf.write(sub_path, os.path.basename(sub_path))
+        for video_title, sub_text in subtitle_files:
+            filename = f"{sanitize_filename(video_title)[:150]}.srt"  # Default to SRT for ZIP
+            zipf.writestr(filename, sub_text.encode('utf-8'))
     zip_buffer.seek(0)
     return zip_buffer, f"{safe_title}_subtitles.zip"
 
 @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=1, max=10))
 def download_subtitles(url, format_choice, temp_dir, is_playlist, progress_bar, total_videos, clean_transcript, cookies_file=None):
-    """Download subtitles using direct timedtext API (manual + auto-generated)."""
+    """Download subtitles using youtube-transcript-api."""
     subtitle_files = []
     try:
         entries, title = get_info(url, is_playlist, cookies_file)
@@ -256,64 +263,26 @@ def download_subtitles(url, format_choice, temp_dir, is_playlist, progress_bar, 
         st.error(f"Error fetching video info: {str(e)}")
         return temp_dir, "unknown", []
 
-    for i, entry in enumerate(entries):
-        video_id = entry.get('id')
-        tracks = entry.get('tracks', []) if 'tracks' in entry else get_caption_tracks(video_id)
-        video_title = f"video_{i+1}"  # Can enhance with title fetch per video
-
-        # Prioritize English manual, then auto
-        selected_track = None
-        for track in tracks:
-            if track.get('languageCode') == 'en' and 'asr' not in track.get('vssId', ''):  # Manual first
-                selected_track = track
-                break
-        if not selected_track:
-            for track in tracks:
-                if 'asr' in track.get('vssId', ''):  # Auto-generated fallback
-                    selected_track = track
-                    break
-        if not selected_track:
-            selected_track = tracks[0] if tracks else None
-        if not selected_track:
-            st.warning(f"No subtitles (manual or auto-generated) available for '{video_title}'")
-            progress_bar.progress((i + 1) / total_videos)
-            continue
-
-        base_url = selected_track['baseUrl']
+    for i, (video_id, video_title) in enumerate(entries):
         try:
-            sub_text = fetch_subtitle(base_url, fmt=format_choice)
-            sanitized_title = sanitize_filename(video_title)[:150]
-            base_path = os.path.join(temp_dir, sanitized_title)
-            sub_path = f"{base_path}.{format_choice}"
-
-            with open(sub_path, 'w', encoding='utf-8') as f:
-                f.write(sub_text)
-
-            # Conversions
-            if format_choice == 'txt':
-                if sub_path.endswith('.vtt'):
-                    sub_path = convert_vtt_to_srt(sub_path)
-                sub_path = convert_srt_to_txt(sub_path)
-            elif format_choice == 'srt' and sub_path.endswith('.vtt'):
-                sub_path = convert_vtt_to_srt(sub_path)
-
-            # Clean
+            sub_text, lang_code, is_auto = get_transcript(video_id, format_choice)
+            
             if clean_transcript:
-                with open(sub_path, 'r', encoding='utf-8') as f:
-                    text = clean_subtitle_text(f.read())
-                with open(sub_path, 'w', encoding='utf-8') as f:
-                    f.write(text)
-
-            subtitle_files.append((video_title, sub_path))
-            lang = format_language_option(selected_track.get('languageCode', 'unknown'))
-            is_auto = ' (Auto-generated)' if 'asr' in selected_track.get('vssId', '') else ''
-            st.info(f"Downloaded subtitles for '{video_title}' in {lang}{is_auto}")
+                sub_text = clean_subtitle_text(sub_text)
+            
+            if format_choice == 'txt':
+                sub_text = convert_srt_to_txt(sub_text)
+            
+            subtitle_files.append((video_title, sub_text))
+            lang_name = format_language_option(lang_code)
+            auto_note = ' (Auto-generated from voice)' if is_auto else ''
+            st.info(f"Downloaded subtitles for '{video_title}' in {lang_name}{auto_note}")
+        except ValueError as ve:
+            st.warning(f"No subtitles available for '{video_title}': {str(ve)}")
         except Exception as e:
-            logging.error(f"Error downloading for '{video_title}': {str(e)}")
+            logging.error(f"Error for '{video_title}': {str(e)}")
             st.warning(f"Error for '{video_title}': {str(e)}")
-            progress_bar.progress((i + 1) / total_videos)
-            continue
-
+        
         progress_bar.progress((i + 1) / total_videos)
 
     return temp_dir, title, subtitle_files
@@ -337,14 +306,10 @@ def main():
         url = st.text_input("YouTube URL", placeholder="Paste video or playlist URL here...")
         
         st.markdown("""
-        **Cookies Instructions**: Optional for restricted content. If needed, upload a cookies file:
-        1. Install the "cookies.txt" extension for Chrome/Firefox.
-        2. Log into YouTube in your browser and access the video/playlist.
-        3. Export cookies using the extension (save as `cookies.txt`).
-        4. Upload the file below.
+        **Cookies Instructions**: Optional for restricted content or rate limits. Upload if needed.
         """)
         cookies_file = None
-        uploaded_file = st.file_uploader("Upload YouTube Cookies (Optional)", type=["txt"], help="For age-restricted or bot-blocked content.")
+        uploaded_file = st.file_uploader("Upload YouTube Cookies (Optional)", type=["txt"])
         if uploaded_file:
             with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as tmp_file:
                 tmp_file.write(uploaded_file.read())
@@ -358,8 +323,7 @@ def main():
         
         clean_transcript = st.checkbox(
             "Clean Transcript (Remove ads/extra newlines)", 
-            value=True, 
-            help="Remove advertisements and normalize formatting in subtitles."
+            value=True
         )
         
         combine_choice = None
@@ -371,19 +335,15 @@ def main():
                     download_scope = st.selectbox(
                         "Download Scope", 
                         ["Entire Playlist", "Single Video"], 
-                        help="Choose whether to download for the playlist or just the video in the URL", 
                         key="download_scope"
                     )
                 if url_type == 'playlist' or (url_type == 'both' and download_scope == 'Entire Playlist'):
                     combine_choice = st.selectbox(
                         "Output Style", 
-                        ["separate", "combined"], 
-                        help="Separate: Individual files in ZIP; Combined: Single file."
+                        ["separate", "combined"]
                     )
             except ValueError as ve:
                 st.error(str(ve))
-            except Exception as e:
-                st.error(f"Error validating URL: {str(e)}")
 
     if st.button("Download Subtitles", type="primary"):
         if not url:
@@ -402,8 +362,8 @@ def main():
                     progress_container = st.empty()
                     progress_bar = progress_container.progress(0.0)
                     
-                    entries, _ = get_info(selected_url, is_playlist, cookies_file)
-                    total_videos = len(entries) or 1
+                    _, _ = get_info(selected_url, is_playlist, cookies_file)  # For count
+                    total_videos = len(get_info(selected_url, is_playlist, cookies_file)[0]) or 1
 
                     output_dir, title, subtitle_files = download_subtitles(
                         selected_url, 
@@ -419,7 +379,7 @@ def main():
                     progress_container.empty()
 
                     if not subtitle_files:
-                        st.error("No subtitles (manual or auto-generated) were downloaded. Check if available.")
+                        st.error("No subtitles were downloaded. Ensure the video has manual or auto-generated captions.")
                         return
 
                     st.success(f"Successfully downloaded {len(subtitle_files)} subtitle file(s)!")
@@ -446,13 +406,11 @@ def main():
                         )
                     else:
                         if subtitle_files:
-                            _, sub_path = subtitle_files[0]
-                            with open(sub_path, 'rb') as f:
-                                file_data = f.read()
+                            _, sub_text = subtitle_files[0]
                             st.download_button(
                                 "Download Subtitle File", 
-                                file_data, 
-                                file_name=os.path.basename(sub_path), 
+                                data=sub_text.encode('utf-8'),
+                                file_name=f"{sanitize_filename(subtitle_files[0][0])[:150]}.{format_choice}", 
                                 mime=mime_type
                             )
                         else:
@@ -464,7 +422,7 @@ def main():
                     st.error(f"Error: {str(e)}")
                 finally:
                     if cookies_file and os.path.exists(cookies_file):
-                        os.unlink(cookies_file)  # Clean up temporary cookies file
+                        os.unlink(cookies_file)
 
 if __name__ == "__main__":
     main()

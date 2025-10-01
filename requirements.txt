@@ -1,3 +1,6 @@
-streamlit==1.39.0
-yt-dlp==2024.10.7
-beautifulsoup4>=4.12.0
+streamlit
+yt-dlp
+tenacity
+requests
+beautifulsoup4  # Still needed for any fallback
+youtube-transcript-api>=0.6.1

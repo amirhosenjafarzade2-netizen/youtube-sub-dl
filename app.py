@@ -372,15 +372,16 @@ def main():
         format_choice = st.selectbox("Format", ["srt", "vtt", "txt"])
         clean_transcript = st.checkbox("Clean Transcript", value=True)
         
-        combine_choice = None
+        combine_choice = "separate"  # Default to separate
         download_scope = 'Entire Playlist'
         if url:
             try:
                 playlist_url, video_url, url_type = validate_url(url)
                 if url_type == 'both':
                     download_scope = st.selectbox("Scope", ["Entire Playlist", "Single Video"], key="scope")
-                if url_type in ['playlist'] or (url_type == 'both' and download_scope == 'Entire Playlist'):
-                    combine_choice = st.selectbox("Output", ["separate", "combined"])
+                is_playlist_mode = url_type in ['playlist'] or (url_type == 'both' and download_scope == "Entire Playlist")
+                if is_playlist_mode:
+                    combine_choice = st.selectbox("Output", ["separate", "combined"], key="combine")
             except ValueError as ve:
                 st.error(str(ve))
 
@@ -426,13 +427,14 @@ def main():
 
                     mime_type = get_mime_type(format_choice)
 
-                    if is_playlist and combine_choice == 'combined':
-                        combined = combine_subtitles(subtitle_files, temp_dir, title, format_choice)
-                        with open(combined, 'rb') as f:
-                            st.download_button("Download Combined", f.read(), os.path.basename(combined), mime_type)
-                    elif is_playlist and combine_choice == 'separate':
-                        zip_buffer, zip_name = create_zip(subtitle_files, title, format_choice)
-                        st.download_button("Download ZIP", zip_buffer, zip_name, "application/zip")
+                    if is_playlist:
+                        if combine_choice == 'combined':
+                            combined = combine_subtitles(subtitle_files, temp_dir, title, format_choice)
+                            with open(combined, 'rb') as f:
+                                st.download_button("Download Combined", f.read(), os.path.basename(combined), mime_type)
+                        else:  # separate
+                            zip_buffer, zip_name = create_zip(subtitle_files, title, format_choice)
+                            st.download_button("Download ZIP", zip_buffer, zip_name, "application/zip")
                     else:
                         _, sub_text = subtitle_files[0]
                         st.download_button(

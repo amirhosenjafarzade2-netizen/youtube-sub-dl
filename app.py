@@ -2,22 +2,20 @@ import streamlit as st
 import os
 import zipfile
 import re
-import glob
 from urllib.parse import urlparse, parse_qs
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import sanitize_filename
 import tempfile
 from io import BytesIO
-import time
 import logging
 from tenacity import retry, stop_after_attempt, wait_exponential
-from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound, CouldNotRetrieveTranscript
+from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, CouldNotRetrieveTranscript
 from youtube_transcript_api.formatters import SRTFormatter, WebVTTFormatter
 
 # Set up logging for debugging
 logging.basicConfig(level=logging.DEBUG)
 
-# Language code to name mapping
+# Language code to name mapping (expanded for Turkish)
 LANGUAGE_NAMES = {
     'en': 'English',
     'tr': 'Türkçe (Turkish)',
@@ -101,44 +99,31 @@ def extract_video_id(url):
     return parse_qs(parsed.query).get('v', [None])[0]
 
 def get_transcript_api(video_id, format_choice='srt'):
-    """Fetch transcript using youtube-transcript-api (fast for public)."""
+    """Fetch transcript using get_transcript (supports manual/auto, multilingual fallback)."""
     try:
-        transcripts = YouTubeTranscriptApi.list_transcripts(video_id)
-        transcript_list = []
-
-        # Prioritize auto-generated English
+        # Try English first
         try:
-            transcript = transcripts.find_generated_transcript(['en'])
-            if transcript:
-                transcript_list.append((transcript.fetch(), 'en', True))  # True for auto
-        except (TranscriptsDisabled, NoTranscriptFound):
-            pass
-
-        # Manual fallback
-        try:
-            transcript = transcripts.find_transcript(['en'])
-            if transcript:
-                transcript_list.append((transcript.fetch(), 'en', False))  # False for manual
-        except (TranscriptsDisabled, NoTranscriptFound):
-            pass
-
-        if not transcript_list:
-            # Any language
-            transcript = next(iter(transcripts), None)
-            if transcript:
-                transcript_list.append((transcript.fetch(), transcript.language_code, False))
-
-        if not transcript_list:
-            raise NoTranscriptFound("No transcripts available")
-
-        transcript_data, lang_code, is_auto = transcript_list[0]
+            transcript_data = YouTubeTranscriptApi.get_transcript(video_id, languages=['en'])
+            lang_code = 'en'
+            is_auto = False  # get_transcript prefers manual if available
+        except NoTranscriptFound:
+            # Fallback to Turkish (for your videos)
+            try:
+                transcript_data = YouTubeTranscriptApi.get_transcript(video_id, languages=['tr'])
+                lang_code = 'tr'
+                is_auto = False
+            except NoTranscriptFound:
+                # Auto-generated fallback (any lang)
+                transcript_data = YouTubeTranscriptApi.get_transcript(video_id)
+                lang_code = transcript_data[0].get('language', 'unknown')
+                is_auto = True
 
         # Format
         if format_choice == 'srt':
             formatter = SRTFormatter()
         elif format_choice == 'vtt':
             formatter = WebVTTFormatter()
-        else:  # txt: format to SRT then strip
+        else:  # txt: SRT then strip
             formatter = SRTFormatter()
             format_choice = 'srt'  # Temp
 
@@ -147,16 +132,16 @@ def get_transcript_api(video_id, format_choice='srt'):
         return sub_text, lang_code, is_auto
 
     except CouldNotRetrieveTranscript as e:
-        raise ValueError(f"Transcript access denied (likely age-restricted): {str(e)}")
+        raise ValueError(f"Access denied (age-restricted?): {str(e)}")
     except Exception as e:
         raise ValueError(f"API error: {str(e)}")
 
 def get_subtitles_yt_dlp(video_url, format_choice, cookies_file=None):
-    """Fallback to yt-dlp for restricted videos with cookies."""
+    """Fallback to yt-dlp for restricted videos."""
     ydl_opts = {
         'writesubtitles': True,
         'writeautomaticsub': True,
-        'subtitleslangs': ['en', 'all'],  # Prioritize English
+        'subtitleslangs': ['en', 'tr', 'all'],
         'subtitlesformat': format_choice,
         'skip_download': True,
         'outtmpl': '%(title)s.%(ext)s',
@@ -169,20 +154,19 @@ def get_subtitles_yt_dlp(video_url, format_choice, cookies_file=None):
     }
     with YoutubeDL(ydl_opts) as ydl:
         try:
-            info = ydl.extract_info(video_url, download=False)
-            # Download subs
             ydl.download([video_url])
-            # Find the English sub file (manual or auto)
-            files = glob.glob('*.en.*') + glob.glob('*.auto.*')
+            # Find sub file (en/tr/auto)
+            files = glob.glob('*.en.*') + glob.glob('*.tr.*') + glob.glob('*.auto.*')
             if files:
-                sub_path = files[0]  # First match
+                sub_path = files[0]
                 with open(sub_path, 'r', encoding='utf-8') as f:
                     sub_text = f.read()
-                os.remove(sub_path)  # Cleanup
+                os.remove(sub_path)
+                lang_code = 'en' if '.en.' in sub_path else 'tr' if '.tr.' in sub_path else 'unknown'
                 is_auto = 'auto' in sub_path
-                return sub_text, 'en', is_auto
+                return sub_text, lang_code, is_auto
             else:
-                raise ValueError("No English subtitles found")
+                raise ValueError("No subtitles found")
         except Exception as e:
             raise ValueError(f"yt-dlp error: {str(e)}")
 
@@ -281,7 +265,7 @@ def create_zip(subtitle_files, title):
 
 @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=1, max=10))
 def download_subtitles(url, format_choice, temp_dir, is_playlist, progress_bar, total_videos, clean_transcript, cookies_file=None):
-    """Download with API fallback to yt-dlp."""
+    """Download with API (fixed for langs) fallback to yt-dlp."""
     subtitle_files = []
     entries, title = get_info(url, is_playlist, cookies_file)
     if not entries:
@@ -292,10 +276,8 @@ def download_subtitles(url, format_choice, temp_dir, is_playlist, progress_bar, 
         video_url = f"https://www.youtube.com/watch?v={video_id}"
         try:
             if cookies_file:
-                # Use yt-dlp for restricted
                 sub_text, lang_code, is_auto = get_subtitles_yt_dlp(video_url, format_choice, cookies_file)
             else:
-                # API for public
                 sub_text, lang_code, is_auto = get_transcript_api(video_id, format_choice)
 
             if clean_transcript:
@@ -310,7 +292,7 @@ def download_subtitles(url, format_choice, temp_dir, is_playlist, progress_bar, 
             st.info(f"Downloaded for '{video_title}' in {lang_name}{auto_note}")
         except ValueError as ve:
             if "age-restricted" in str(ve).lower() or "access denied" in str(ve).lower():
-                st.warning(f"'{video_title}' is age-restricted. Upload cookies to access subs.")
+                st.warning(f"'{video_title}' is age-restricted. Upload cookies to access.")
             else:
                 st.warning(f"No subs for '{video_title}': {str(ve)}")
         except Exception as e:
@@ -327,14 +309,14 @@ def get_mime_type(format_choice):
 def main():
     st.set_page_config(page_title="YouTube Subtitle Downloader", page_icon="🎥", layout="wide")
     st.title("YouTube Subtitle Downloader 🎥")
-    st.markdown("Download subtitles (manual or auto-generated from voice) from YouTube videos/playlists!")
+    st.markdown("Download subtitles (manual or auto-generated from voice) from YouTube videos/playlists! Supports Turkish/EN.")
     
     with st.sidebar:
         st.header("Settings")
         url = st.text_input("YouTube URL", placeholder="Paste video or playlist URL here...")
         
         st.markdown("""
-        **For Age-Restricted Videos**: Upload cookies to bypass blocks (e.g., horror/true crime).
+        **For Age-Restricted Videos**: Upload cookies to bypass blocks.
         1. Use "cookies.txt" browser extension.
         2. Log in to YouTube, visit the video.
         3. Export as cookies.txt and upload.
@@ -356,7 +338,7 @@ def main():
                 _, _, url_type = validate_url(url)
                 if url_type == 'both':
                     download_scope = st.selectbox("Scope", ["Entire Playlist", "Single Video"], key="scope")
-                if url_type in ['playlist', ('both' if download_scope == 'Entire Playlist' else '')]:
+                if url_type in ['playlist'] or (url_type == 'both' and download_scope == 'Entire Playlist'):
                     combine_choice = st.selectbox("Output", ["separate", "combined"])
             except ValueError as ve:
                 st.error(str(ve))
@@ -371,7 +353,7 @@ def main():
                 try:
                     _, corrected_video_url, url_type = validate_url(url)
                     is_playlist = url_type == 'playlist' or (url_type == 'both' and download_scope == "Entire Playlist")
-                    selected_url = corrected_video_url if not is_playlist else url  # Simplified
+                    selected_url = corrected_video_url if not is_playlist else url
                     
                     st.info(f"{'Playlist' if is_playlist else 'Video'}: {selected_url}")
 
@@ -386,7 +368,7 @@ def main():
                     )
 
                     if not subtitle_files:
-                        st.error("No subs found. Try uploading cookies for restricted videos.")
+                        st.error("No subs found. Try cookies for restricted or check video availability.")
                         return
 
                     st.success(f"Downloaded {len(subtitle_files)} file(s)!")

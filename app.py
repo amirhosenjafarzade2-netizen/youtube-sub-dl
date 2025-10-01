@@ -99,22 +99,20 @@ def extract_video_id(url):
         return parsed.path.lstrip('/')
     return parse_qs(parsed.query).get('v', [None])[0]
 
-def get_transcript_api(video_id, format_choice='srt'):
+def get_transcript_api(video_id, format_choice='srt', target_lang='en'):
     """Fetch transcript using get_transcript (supports manual/auto, multilingual fallback)."""
     try:
-        # Try English first
-        try:
-            transcript_data = YouTubeTranscriptApi.get_transcript(video_id, languages=['en'])
-            lang_code = 'en'
-            is_auto = False  # get_transcript prefers manual if available
-        except NoTranscriptFound:
-            # Fallback to Turkish (for your videos)
+        if target_lang == 'auto':
+            transcript_data = YouTubeTranscriptApi.get_transcript(video_id)
+            lang_code = transcript_data[0].get('language', 'unknown')
+            is_auto = True
+        else:
             try:
-                transcript_data = YouTubeTranscriptApi.get_transcript(video_id, languages=['tr'])
-                lang_code = 'tr'
+                transcript_data = YouTubeTranscriptApi.get_transcript(video_id, languages=[target_lang])
+                lang_code = target_lang
                 is_auto = False
             except NoTranscriptFound:
-                # Auto-generated fallback (any lang)
+                # Fallback to auto
                 transcript_data = YouTubeTranscriptApi.get_transcript(video_id)
                 lang_code = transcript_data[0].get('language', 'unknown')
                 is_auto = True
@@ -137,16 +135,13 @@ def get_transcript_api(video_id, format_choice='srt'):
     except Exception as e:
         raise ValueError(f"API error: {str(e)}")
 
-def get_subtitles_yt_dlp(video_url, format_choice, cookies_file, temp_dir):
+def get_subtitles_yt_dlp(video_url, format_choice, cookies_file, temp_dir, target_lang='en'):
     """Fallback to yt-dlp for restricted videos."""
     # For TXT, use SRT format and convert later
     dl_format = 'srt' if format_choice == 'txt' else format_choice
     ydl_opts = {
         'writesubtitles': True,
         'writeautomaticsub': True,
-        'subtitleslangs': ['en', 'tr'],
-        'automaticsubslangs': ['en', 'tr'],
-        'subtitlesformat': dl_format,
         'skip_download': True,
         'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
         'quiet': True,
@@ -156,27 +151,39 @@ def get_subtitles_yt_dlp(video_url, format_choice, cookies_file, temp_dir):
         'restrict_filenames': True,
         'ignoreerrors': True,
     }
+    if target_lang != 'auto':
+        ydl_opts['subtitleslangs'] = [target_lang]
+        ydl_opts['automaticsubslangs'] = [target_lang]
+        ydl_opts['subtitlesformat'] = dl_format
+    else:
+        ydl_opts['subtitleslangs'] = ['en', 'tr']
+        ydl_opts['automaticsubslangs'] = ['en', 'tr']
+        ydl_opts['subtitlesformat'] = dl_format
     with YoutubeDL(ydl_opts) as ydl:
         try:
             ydl.download([video_url])
-            # Find sub file (prefer manual en > auto en > manual tr > auto tr)
-            files = (
-                glob.glob(os.path.join(temp_dir, f'*.en.srt')) +
-                glob.glob(os.path.join(temp_dir, f'*.en.vtt')) +
-                glob.glob(os.path.join(temp_dir, f'*.tr.srt')) +
-                glob.glob(os.path.join(temp_dir, f'*.tr.vtt'))
-            )
+            # Find sub file based on target_lang
+            if target_lang != 'auto':
+                files = (
+                    glob.glob(os.path.join(temp_dir, f'*.{target_lang}.{dl_format}')) +
+                    glob.glob(os.path.join(temp_dir, f'*.{target_lang}.vtt'))
+                )
+            else:
+                files = (
+                    glob.glob(os.path.join(temp_dir, f'*.en.srt')) +
+                    glob.glob(os.path.join(temp_dir, f'*.en.vtt')) +
+                    glob.glob(os.path.join(temp_dir, f'*.tr.srt')) +
+                    glob.glob(os.path.join(temp_dir, f'*.tr.vtt'))
+                )
             if files:
                 sub_path = files[0]
                 with open(sub_path, 'r', encoding='utf-8') as f:
                     sub_text = f.read()
                 os.remove(sub_path)
-                if '.en.' in sub_path:
-                    lang_code = 'en'
-                elif '.tr.' in sub_path:
-                    lang_code = 'tr'
+                if target_lang != 'auto':
+                    lang_code = target_lang
                 else:
-                    lang_code = 'unknown'
+                    lang_code = 'en' if '.en.' in sub_path else 'tr' if '.tr.' in sub_path else 'unknown'
                 is_auto = 'auto' in sub_path.lower()
                 return sub_text, lang_code, is_auto
             else:
@@ -294,7 +301,7 @@ def create_zip(subtitle_files, title, format_choice):
     return zip_buffer, f"{safe_title}_subtitles.zip"
 
 @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=1, max=10))
-def download_subtitles(url, format_choice, temp_dir, is_playlist, progress_bar, total_videos, clean_transcript, cookies_file=None):
+def download_subtitles(url, format_choice, temp_dir, is_playlist, progress_bar, total_videos, clean_transcript, cookies_file=None, target_lang='en'):
     """Download with API fallback to yt-dlp (with or without cookies)."""
     subtitle_files = []
     entries, title = get_info(url, is_playlist, cookies_file)
@@ -307,11 +314,11 @@ def download_subtitles(url, format_choice, temp_dir, is_playlist, progress_bar, 
         try:
             # Always try API first
             try:
-                sub_text, lang_code, is_auto = get_transcript_api(video_id, format_choice)
+                sub_text, lang_code, is_auto = get_transcript_api(video_id, format_choice, target_lang)
                 fallback_used = False
             except:
                 # Fallback to yt-dlp
-                sub_text, lang_code, is_auto = get_subtitles_yt_dlp(video_url, format_choice, cookies_file, temp_dir)
+                sub_text, lang_code, is_auto = get_subtitles_yt_dlp(video_url, format_choice, cookies_file, temp_dir, target_lang)
                 fallback_used = True
                 if not cookies_file:
                     st.info(f"Used yt-dlp fallback (no cookies) for '{video_title}'")
@@ -372,6 +379,9 @@ def main():
         format_choice = st.selectbox("Format", ["srt", "vtt", "txt"])
         clean_transcript = st.checkbox("Clean Transcript", value=True)
         
+        target_display = st.radio("Target Language", ['English', 'Turkish', 'Auto'], horizontal=True)
+        target_lang = {'English':'en', 'Turkish':'tr', 'Auto':'auto'}[target_display]
+        
         combine_choice = "separate"  # Default to separate
         download_scope = 'Entire Playlist'
         if url:
@@ -416,7 +426,7 @@ def main():
 
                     _, title, subtitle_files = download_subtitles(
                         selected_url, format_choice, temp_dir, is_playlist,
-                        progress_bar, total_videos, clean_transcript, cookies_file
+                        progress_bar, total_videos, clean_transcript, cookies_file, target_lang
                     )
 
                     if not subtitle_files:

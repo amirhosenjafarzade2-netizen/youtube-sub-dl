@@ -1,4 +1,3 @@
-from playlist_selector import enhanced_playlist_handler, create_video_zip
 import streamlit as st
 import os
 import zipfile
@@ -383,17 +382,6 @@ def main():
         target_display = st.radio("Target Language", ['English', 'Turkish', 'Auto'], horizontal=True)
         target_lang = {'English':'en', 'Turkish':'tr', 'Auto':'auto'}[target_display]
         
-        # New video download options
-        download_videos = st.checkbox("Download Videos Too", value=False)
-        quality_options = {
-            "Best Quality": "best",
-            "720p": "best[height<=720]",
-            "480p": "best[height<=480]",
-            "Audio Only": "bestaudio"
-        }
-        quality = st.selectbox("Video Quality", list(quality_options.keys()), index=0, disabled=not download_videos)
-        selected_quality = quality_options[quality]
-        
         combine_choice = "separate"  # Default to separate
         download_scope = 'Entire Playlist'
         if url:
@@ -407,77 +395,53 @@ def main():
             except ValueError as ve:
                 st.error(str(ve))
 
-    # Dynamic button text based on video download option
-    button_text = "Download Videos & Subtitles" if download_videos else "Download Subtitles"
-    if st.button(button_text, type="primary"):
+    if st.button("Download Subtitles", type="primary"):
         if not url:
             st.error("Enter URL.")
             return
 
         with st.spinner("Fetching..."):
-            try:
-                playlist_url, video_url, url_type = validate_url(url)
-                if url_type == 'both' and download_scope == 'Entire Playlist':
-                    selected_url = playlist_url
-                    is_playlist = True
-                elif url_type == 'both' and download_scope == 'Single Video':
-                    selected_url = video_url
-                    is_playlist = False
-                elif url_type == 'playlist':
-                    selected_url = playlist_url
-                    is_playlist = True
-                else:  # video
-                    selected_url = video_url
-                    is_playlist = False
-                
-                st.info(f"{'Playlist' if is_playlist else 'Video'}: {selected_url}")
+            with tempfile.TemporaryDirectory() as temp_dir:
+                try:
+                    playlist_url, video_url, url_type = validate_url(url)
+                    if url_type == 'both' and download_scope == 'Entire Playlist':
+                        selected_url = playlist_url
+                        is_playlist = True
+                    elif url_type == 'both' and download_scope == 'Single Video':
+                        selected_url = video_url
+                        is_playlist = False
+                    elif url_type == 'playlist':
+                        selected_url = playlist_url
+                        is_playlist = True
+                    else:  # video
+                        selected_url = video_url
+                        is_playlist = False
+                    
+                    st.info(f"{'Playlist' if is_playlist else 'Video'}: {selected_url}")
 
-                # Use enhanced handler for video downloads or playlists (for selection); fallback to original for subs-only single videos
-                if download_videos or is_playlist:
-                    # Call enhanced handler, passing original functions (note: module should accept clean_func=..., convert_func=... if not already)
-                    selected_entries, title, subtitle_files, video_files = enhanced_playlist_handler(
-                        url=selected_url,
-                        cookies_file=cookies_file,
-                        download_videos=download_videos,
-                        quality=selected_quality,
-                        format_choice=format_choice,
-                        target_lang=target_lang,
-                        clean_transcript=clean_transcript,
-                        get_transcript_api=get_transcript_api,
-                        get_subtitles_yt_dlp=get_subtitles_yt_dlp,
-                        # Add if module updated: clean_func=clean_subtitle_text, convert_func=convert_srt_to_txt
-                    )
-                else:
-                    # Original subs-only logic for single video
                     progress_bar = st.progress(0.0)
+                    
                     entries, _ = get_info(selected_url, is_playlist, cookies_file)
                     total_videos = len(entries) or 1
+
                     _, title, subtitle_files = download_subtitles(
-                        selected_url, format_choice, tempfile.gettempdir(), is_playlist,  # Use temp dir
+                        selected_url, format_choice, temp_dir, is_playlist,
                         progress_bar, total_videos, clean_transcript, cookies_file, target_lang
                     )
-                    video_files = []
 
-                if not subtitle_files:
-                    st.error("No subs found. Try a different video or upload cookies for restricted content.")
-                    return
+                    if not subtitle_files:
+                        st.error("No subs found. Try a different video or upload cookies for restricted content.")
+                        return
 
-                st.success(f"Downloaded {len(subtitle_files)} file(s)!")
+                    st.success(f"Downloaded {len(subtitle_files)} file(s)!")
 
-                mime_type = get_mime_type(format_choice)
+                    mime_type = get_mime_type(format_choice)
 
-                if download_videos:
-                    # ZIP with videos + subs
-                    zip_buffer, zip_name = create_video_zip(video_files, subtitle_files, title)
-                    st.download_button("Download Videos + Subs ZIP", zip_buffer, zip_name, "application/zip")
-                else:
-                    # Original subs output
                     if is_playlist:
                         if combine_choice == 'combined':
-                            with tempfile.TemporaryDirectory() as temp_dir:
-                                combined = combine_subtitles(subtitle_files, temp_dir, title, format_choice)
-                                with open(combined, 'rb') as f:
-                                    st.download_button("Download Combined", f.read(), os.path.basename(combined), mime_type)
+                            combined = combine_subtitles(subtitle_files, temp_dir, title, format_choice)
+                            with open(combined, 'rb') as f:
+                                st.download_button("Download Combined", f.read(), os.path.basename(combined), mime_type)
                         else:  # separate
                             zip_buffer, zip_name = create_zip(subtitle_files, title, format_choice)
                             st.download_button("Download ZIP", zip_buffer, zip_name, "application/zip")
@@ -488,11 +452,11 @@ def main():
                             f"{sanitize_filename(subtitle_files[0][0])[:150]}.{format_choice}", mime_type
                         )
 
-            except Exception as e:
-                st.error(f"Error: {str(e)}")
-            finally:
-                if cookies_file and os.path.exists(cookies_file):
-                    os.unlink(cookies_file)
+                except Exception as e:
+                    st.error(f"Error: {str(e)}")
+                finally:
+                    if cookies_file and os.path.exists(cookies_file):
+                        os.unlink(cookies_file)
 
 if __name__ == "__main__":
     main()

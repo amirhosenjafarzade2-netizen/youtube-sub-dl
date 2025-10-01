@@ -139,12 +139,14 @@ def get_transcript_api(video_id, format_choice='srt'):
 
 def get_subtitles_yt_dlp(video_url, format_choice, cookies_file, temp_dir):
     """Fallback to yt-dlp for restricted videos."""
+    # For TXT, use SRT format and convert later
+    dl_format = 'srt' if format_choice == 'txt' else format_choice
     ydl_opts = {
         'writesubtitles': True,
         'writeautomaticsub': True,
         'subtitleslangs': ['en', 'tr'],
         'automaticsubslangs': ['en', 'tr'],
-        'subtitlesformat': format_choice,
+        'subtitlesformat': dl_format,
         'skip_download': True,
         'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
         'quiet': True,
@@ -159,10 +161,10 @@ def get_subtitles_yt_dlp(video_url, format_choice, cookies_file, temp_dir):
             ydl.download([video_url])
             # Find sub file (prefer manual en > auto en > manual tr > auto tr)
             files = (
-                glob.glob(os.path.join(temp_dir, f'*.en.{format_choice}')) +
-                glob.glob(os.path.join(temp_dir, f'*.en.{format_choice}.vtt')) +  # sometimes .vtt even if format is srt
-                glob.glob(os.path.join(temp_dir, f'*.tr.{format_choice}')) +
-                glob.glob(os.path.join(temp_dir, f'*.tr.{format_choice}.vtt'))
+                glob.glob(os.path.join(temp_dir, f'*.en.srt')) +
+                glob.glob(os.path.join(temp_dir, f'*.en.vtt')) +
+                glob.glob(os.path.join(temp_dir, f'*.tr.srt')) +
+                glob.glob(os.path.join(temp_dir, f'*.tr.vtt'))
             )
             if files:
                 sub_path = files[0]
@@ -211,18 +213,34 @@ def get_info(url, is_playlist=False, cookies_file=None):
         return [(video_id, title)], title
 
 def convert_srt_to_txt(srt_text):
-    """Convert SRT to TXT."""
+    """Convert SRT or VTT to TXT by removing timestamps, numbering, and tags."""
+    # Handle both SRT and VTT formats
     lines = srt_text.split('\n')
     txt_lines = []
     i = 0
     while i < len(lines):
         line = lines[i].strip()
-        if re.match(r'^\d+$', line) or re.match(r'^\d{2}:\d{2}:\d{2}[,\.]\d{3} --> \d{2}:\d{2}:\d{2}[,\.]\d{3}$', line):
+        # Skip SRT/VTT numbering
+        if re.match(r'^\d+$', line):
             i += 1
             continue
+        # Skip SRT timestamps
+        if re.match(r'^\d{2}:\d{2}:\d{2}[,\.]\d{3} --> \d{2}:\d{2}:\d{2}[,\.]\d{3}$', line):
+            i += 1
+            continue
+        # Skip VTT timestamps (slightly different format)
+        if re.match(r'^\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3}', line):
+            i += 1
+            continue
+        # Skip VTT cues like "NOTE" or empty lines in between
+        if line.startswith('NOTE') or not line:
+            i += 1
+            continue
+        # Clean tags and webvtt specifics
         line = re.sub(r'<[\d:.]+>', '', line)
         line = re.sub(r'</?c[^>]*>', '', line)
         line = re.sub(r'</?v[^>]*>', '', line)
+        line = re.sub(r'WEBVTT\n.*?\n', '', line, flags=re.DOTALL)  # Remove WEBVTT header if present
         if line:
             txt_lines.append(line)
         i += 1

@@ -407,7 +407,9 @@ def main():
             except ValueError as ve:
                 st.error(str(ve))
 
-    if st.button("Download Subtitles", type="primary"):
+    # Dynamic button text based on video download option
+    button_text = "Download Videos & Subtitles" if download_videos else "Download Subtitles"
+    if st.button(button_text, type="primary"):
         if not url:
             st.error("Enter URL.")
             return

@@ -112,24 +112,20 @@ CUSTOM_CSS = """
     --radius-lg: 16px;
 }
 
-/* Base */
 html, body, [class*="css"] {
     font-family: var(--sans) !important;
     background-color: var(--bg) !important;
     color: var(--text) !important;
 }
 
-/* Hide Streamlit chrome */
 #MainMenu, footer, header { visibility: hidden; }
 .stDeployButton { display: none !important; }
 
-/* Main content area */
 .main .block-container {
     padding: 2.5rem 2.5rem 4rem !important;
     max-width: 900px !important;
 }
 
-/* ─── HERO HEADER ─── */
 .yt-hero {
     display: flex;
     align-items: center;
@@ -164,7 +160,6 @@ html, body, [class*="css"] {
     font-weight: 300;
 }
 
-/* ─── URL INPUT CARD ─── */
 .url-card {
     background: var(--surface);
     border: 1px solid var(--border);
@@ -177,18 +172,6 @@ html, body, [class*="css"] {
     border-color: var(--accent);
 }
 
-/* ─── SECTION LABELS ─── */
-.section-label {
-    font-family: var(--mono);
-    font-size: 0.7rem;
-    font-weight: 500;
-    letter-spacing: 0.12em;
-    text-transform: uppercase;
-    color: var(--text-faint);
-    margin-bottom: 0.6rem;
-}
-
-/* ─── BADGE ─── */
 .url-badge {
     display: inline-flex;
     align-items: center;
@@ -204,29 +187,6 @@ html, body, [class*="css"] {
     font-weight: 500;
 }
 
-/* ─── OPTIONS GRID ─── */
-.options-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr 1fr;
-    gap: 1rem;
-    margin-bottom: 1.5rem;
-}
-.option-card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 1rem 1.1rem 0.9rem;
-}
-.option-card-label {
-    font-family: var(--mono);
-    font-size: 0.68rem;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
-    color: var(--text-faint);
-    margin-bottom: 0.4rem;
-}
-
-/* ─── STREAMLIT INPUT OVERRIDES ─── */
 .stTextInput > div > div > input {
     background: var(--surface2) !important;
     border: 1px solid var(--border) !important;
@@ -263,7 +223,6 @@ html, body, [class*="css"] {
     color: var(--text-faint) !important;
 }
 
-/* Radio buttons */
 .stRadio > label {
     font-family: var(--mono) !important;
     font-size: 0.7rem !important;
@@ -276,12 +235,10 @@ html, body, [class*="css"] {
     font-family: var(--sans) !important;
 }
 
-/* Checkbox */
 .stCheckbox > label > div {
     font-size: 0.85rem !important;
 }
 
-/* Slider */
 .stSlider > label {
     font-family: var(--mono) !important;
     font-size: 0.7rem !important;
@@ -302,7 +259,6 @@ html, body, [class*="css"] {
     background: var(--accent) !important;
 }
 
-/* ─── PRIMARY BUTTON ─── */
 .stButton > button[kind="primary"] {
     background: var(--accent) !important;
     color: #0d0d0f !important;
@@ -331,7 +287,6 @@ html, body, [class*="css"] {
     transform: none !important;
 }
 
-/* Secondary buttons */
 .stButton > button[kind="secondary"] {
     background: var(--surface2) !important;
     color: var(--text) !important;
@@ -346,7 +301,6 @@ html, body, [class*="css"] {
     color: var(--accent) !important;
 }
 
-/* Download button */
 .stDownloadButton > button {
     background: var(--surface2) !important;
     color: var(--accent) !important;
@@ -363,7 +317,6 @@ html, body, [class*="css"] {
     box-shadow: 0 0 20px var(--accent-dim) !important;
 }
 
-/* ─── PROGRESS / STATUS ─── */
 .stProgress > div > div > div > div {
     background: var(--accent) !important;
     border-radius: 99px !important;
@@ -374,7 +327,6 @@ html, body, [class*="css"] {
     height: 4px !important;
 }
 
-/* ─── METRICS ─── */
 [data-testid="metric-container"] {
     background: var(--surface) !important;
     border: 1px solid var(--border) !important;
@@ -395,23 +347,11 @@ html, body, [class*="css"] {
     color: var(--text-muted) !important;
 }
 
-/* ─── ALERTS ─── */
 [data-testid="stAlert"] {
     border-radius: var(--radius) !important;
     border: 1px solid !important;
     font-family: var(--sans) !important;
     font-size: 0.88rem !important;
-}
-[data-testid="stAlert"][data-baseweb="notification"][aria-label*="Error"] {
-    background: rgba(255, 92, 92, 0.08) !important;
-    border-color: rgba(255, 92, 92, 0.35) !important;
-    color: #ffb3b3 !important;
-}
-[data-testid="stAlert"][data-baseweb="notification"][aria-label*="Info"],
-div[data-testid="stInfoMessage"] {
-    background: var(--accent-dim2) !important;
-    border-color: rgba(232, 255, 71, 0.25) !important;
-    color: #c8d8a0 !important;
 }
 div[data-testid="stSuccessMessage"] {
     background: rgba(92, 255, 160, 0.07) !important;
@@ -423,7 +363,6 @@ div[data-testid="stWarningMessage"] {
     border-color: rgba(255, 180, 50, 0.3) !important;
 }
 
-/* ─── EXPANDERS ─── */
 [data-testid="stExpander"] {
     background: var(--surface) !important;
     border: 1px solid var(--border) !important;
@@ -438,11 +377,7 @@ div[data-testid="stWarningMessage"] {
 [data-testid="stExpander"] summary:hover {
     background: var(--surface2) !important;
 }
-[data-testid="stExpander"] [data-testid="stExpanderDetails"] {
-    padding: 0.5rem 1rem 1rem !important;
-}
 
-/* ─── SIDEBAR ─── */
 [data-testid="stSidebar"] {
     background: var(--surface) !important;
     border-right: 1px solid var(--border) !important;
@@ -462,7 +397,6 @@ div[data-testid="stWarningMessage"] {
     border-bottom: 1px solid var(--border) !important;
 }
 
-/* File uploader */
 [data-testid="stFileUploader"] {
     background: var(--surface2) !important;
     border: 1px dashed var(--border-bright) !important;
@@ -474,14 +408,12 @@ div[data-testid="stWarningMessage"] {
     border-color: var(--accent) !important;
 }
 
-/* ─── DIVIDER ─── */
 hr {
     border: none !important;
     border-top: 1px solid var(--border) !important;
     margin: 1.5rem 0 !important;
 }
 
-/* ─── TOAST ─── */
 [data-testid="stToast"] {
     background: var(--surface2) !important;
     border: 1px solid var(--border-bright) !important;
@@ -491,19 +423,12 @@ hr {
     font-size: 0.85rem !important;
 }
 
-/* ─── SPINNER ─── */
 [data-testid="stSpinner"] p {
     font-family: var(--mono) !important;
     font-size: 0.82rem !important;
     color: var(--text-muted) !important;
 }
 
-/* ─── CAPTION / CODE ─── */
-.stCaption, [data-testid="stCaptionContainer"] {
-    color: var(--text-faint) !important;
-    font-family: var(--mono) !important;
-    font-size: 0.75rem !important;
-}
 code {
     background: var(--surface2) !important;
     border: 1px solid var(--border) !important;
@@ -514,7 +439,6 @@ code {
     color: var(--accent) !important;
 }
 
-/* ─── MARKDOWN TEXT ─── */
 .stMarkdown p, .stMarkdown li {
     font-size: 0.88rem !important;
     line-height: 1.65 !important;
@@ -532,7 +456,6 @@ code {
     text-decoration: underline !important;
 }
 
-/* Results section */
 .results-header {
     font-family: var(--mono);
     font-size: 0.7rem;
@@ -540,13 +463,6 @@ code {
     text-transform: uppercase;
     color: var(--text-faint);
     margin-bottom: 1rem;
-}
-
-/* Status text */
-.stEmpty p {
-    font-family: var(--mono) !important;
-    font-size: 0.82rem !important;
-    color: var(--text-muted) !important;
 }
 </style>
 """
@@ -800,6 +716,7 @@ def _ydl_base_opts(cookies_file, proxy_url) -> dict:
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def get_channel_info(channel_url, cookies_file=None, proxy_url=None):
+    """Fetch all video IDs and titles from a channel."""
     videos_url = channel_url.rstrip("/")
     if not videos_url.endswith("/videos"):
         videos_url += "/videos"
@@ -808,17 +725,24 @@ def get_channel_info(channel_url, cookies_file=None, proxy_url=None):
         result = ydl.extract_info(videos_url, download=False)
     entries = result.get("entries", [])
     channel_title = result.get("channel", result.get("title", "channel_subtitles"))
-    return [(e["id"], e.get("title", f"video_{i+1}")) for i, e in enumerate(entries) if e and e.get("id")], channel_title
+    return (
+        [(e["id"], e.get("title", f"video_{i+1}")) for i, e in enumerate(entries) if e and e.get("id")],
+        channel_title,
+    )
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def get_info(url, is_playlist=False, cookies_file=None, proxy_url=None):
+    """Fetch entries for a playlist or single video."""
     if is_playlist:
         opts = {**_ydl_base_opts(cookies_file, proxy_url), "extract_flat": True}
         with YoutubeDL(opts) as ydl:
             result = ydl.extract_info(url, download=False)
         entries = result.get("entries", [])
-        return [(e.get("id"), e.get("title", f"video_{i+1}")) for i, e in enumerate(entries) if e and e.get("id")], result.get("title", "playlist_subtitles")
+        return (
+            [(e.get("id"), e.get("title", f"video_{i+1}")) for i, e in enumerate(entries) if e and e.get("id")],
+            result.get("title", "playlist_subtitles"),
+        )
     else:
         video_id = extract_video_id(url)
         if not video_id:
@@ -880,7 +804,11 @@ def combine_subtitles(subtitle_files, output_dir, title, format_choice):
         if format_choice == "vtt":
             out.write("WEBVTT\n\n")
         for video_title, sub_text in subtitle_files:
-            sep = f"\n\n### {video_title} ###\n\n" if format_choice == "txt" else f"\n\n=== {video_title} ===\n\n"
+            sep = (
+                f"\n\n### {video_title} ###\n\n"
+                if format_choice == "txt"
+                else f"\n\n=== {video_title} ===\n\n"
+            )
             out.write(sep)
             if format_choice in ("srt", "vtt"):
                 lines = sub_text.split("\n")
@@ -929,10 +857,24 @@ def _classify_error(combined_err: str) -> str:
 
 
 def download_subtitles(
-    entries, format_choice, temp_dir, progress_bar, status_text,
-    clean_transcript, cookies_file=None, proxy_url=None,
-    target_lang="en", rate_limit_delay=1.0, debug_mode=False,
+    entries,
+    format_choice,
+    temp_dir,
+    progress_bar,
+    status_text,
+    clean_transcript,
+    cookies_file=None,
+    proxy_url=None,
+    target_lang="en",
+    rate_limit_delay=1.0,
+    debug_mode=False,
 ):
+    """
+    Download subtitles for a list of (video_id, video_title) entries.
+    Returns (subtitle_files, failed_videos).
+    subtitle_files: list of (video_title, sub_text)
+    failed_videos:  list of (video_title, reason)
+    """
     subtitle_files = []
     failed_videos = []
     total = len(entries)
@@ -951,6 +893,7 @@ def download_subtitles(
         fallback_used = False
         api_error = ""
 
+        # Attempt 1: youtube-transcript-api
         try:
             sub_text, lang_code, is_auto = get_transcript_api(
                 video_id, format_choice, target_lang,
@@ -961,6 +904,7 @@ def download_subtitles(
             if debug_mode:
                 st.caption(f"API failed `{video_id}`: {api_error[:150]}")
 
+        # Attempt 2: yt-dlp fallback
         if sub_text is None:
             fallback_used = True
             if debug_mode:
@@ -1045,10 +989,8 @@ def main() -> None:
         initial_sidebar_state="expanded",
     )
 
-    # Inject custom CSS
     st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
-    # Hero header
     st.markdown("""
     <div class="yt-hero">
         <div class="yt-hero-icon">🎥</div>
@@ -1063,7 +1005,6 @@ def main() -> None:
     with st.sidebar:
         st.markdown("### ⚙️ Settings")
 
-        # Cookies
         with st.expander("🍪 Cookies  (fix bot / age-restricted errors)"):
             st.markdown(
                 "**When to upload:**\n"
@@ -1079,7 +1020,6 @@ def main() -> None:
             )
             uploaded_file = st.file_uploader("Upload cookies.txt", type=["txt"])
 
-        # Proxy
         with st.expander("🌐 Proxy  (alternative bot-detection bypass)"):
             st.markdown(
                 "Format: `http://user:password@host:port`\n\n"
@@ -1094,12 +1034,9 @@ def main() -> None:
         st.divider()
 
         format_choice = st.selectbox("Format", ["srt", "vtt", "txt"])
-
         target_display = st.radio("Language", ["English", "Turkish", "Auto"], horizontal=True)
         target_lang = {"English": "en", "Turkish": "tr", "Auto": "auto"}[target_display]
-
         clean_transcript = st.checkbox("Clean transcript", value=True, help="Remove ad markers and repeated lines")
-
         rate_limit_delay = st.slider("Delay between videos (s)", 0.5, 5.0, 1.0, 0.5)
         debug_mode = st.checkbox("Debug mode", value=False)
 
@@ -1137,8 +1074,16 @@ def main() -> None:
     if url:
         try:
             primary_url, secondary_url, url_type = validate_url(url)
-            type_icons = {"video": "🎬 Video", "playlist": "📋 Playlist", "channel": "📺 Channel", "both": "🎬 + 📋 Video in Playlist"}
-            st.markdown(f'<div class="url-badge">✓ {type_icons.get(url_type, url_type.upper())}</div>', unsafe_allow_html=True)
+            type_icons = {
+                "video": "🎬 Video",
+                "playlist": "📋 Playlist",
+                "channel": "📺 Channel",
+                "both": "🎬 + 📋 Video in Playlist",
+            }
+            st.markdown(
+                f'<div class="url-badge">✓ {type_icons.get(url_type, url_type.upper())}</div>',
+                unsafe_allow_html=True,
+            )
         except ValueError as ve:
             st.error(str(ve))
             url_type = None
@@ -1147,6 +1092,7 @@ def main() -> None:
 
     # ── Channel UI ─────────────────────────────────────────────────────────────
     if url_type == "channel":
+        # Reset cached entries when URL changes
         if st.session_state.get("_last_channel_url") != url:
             st.session_state.pop("channel_entries", None)
             st.session_state.pop("channel_title", None)
@@ -1158,6 +1104,7 @@ def main() -> None:
                     fetched_entries, fetched_title = get_channel_info(url, cookies_path, proxy_url)
                     st.session_state["channel_entries"] = fetched_entries
                     st.session_state["channel_title"] = fetched_title
+                    st.success(f"Found **{len(fetched_entries)} videos** in *{fetched_title}*")
                 except Exception as e:
                     st.error(f"Could not fetch channel: {e}")
 
@@ -1165,7 +1112,7 @@ def main() -> None:
         channel_title: str = st.session_state.get("channel_title", "channel")
 
         if channel_entries:
-            st.success(f"Found **{len(channel_entries)} videos** in *{channel_title}*")
+            st.info(f"📺 **{len(channel_entries)} videos** ready — *{channel_title}*")
             combine_choice = st.radio(
                 "Output format",
                 ["separate", "combined"],
@@ -1176,6 +1123,7 @@ def main() -> None:
                 ),
             )
 
+    # ── Playlist / video-in-playlist UI ───────────────────────────────────────
     elif url_type in ("playlist", "both"):
         if url_type == "both":
             download_scope = st.selectbox("Download scope", ["Entire Playlist", "Single Video"])
@@ -1189,23 +1137,28 @@ def main() -> None:
     # ── Download button ────────────────────────────────────────────────────────
     st.markdown("")
     btn_disabled = not url or url_type is None
+    # For channel type, also disable until entries are fetched
+    if url_type == "channel" and not st.session_state.get("channel_entries"):
+        btn_disabled = True
+
     if st.button("⬇️  Download Subtitles", type="primary", disabled=btn_disabled, use_container_width=False):
         try:
             with tempfile.TemporaryDirectory() as temp_dir:
+
+                # ── Channel branch ─────────────────────────────────────────
                 if url_type == "channel":
-                    if not st.session_state.get("channel_entries"):
-                        st.error("Please click **Fetch video list** first.")
-                    else:
-                        ch_entries = st.session_state["channel_entries"]
-                        ch_title = st.session_state["channel_title"]
-                        pb = st.progress(0.0)
-                        st_text = st.empty()
-                        sub_files, fails = download_subtitles(
-                            ch_entries, format_choice, temp_dir, pb, st_text,
-                            clean_transcript, cookies_path, proxy_url,
-                            target_lang, rate_limit_delay, debug_mode,
-                        )
-                        render_results(sub_files, fails, ch_title, format_choice, combine_choice, temp_dir)
+                    ch_entries = st.session_state["channel_entries"]
+                    ch_title = st.session_state["channel_title"]
+                    pb = st.progress(0.0)
+                    st_text = st.empty()
+                    sub_files, fails = download_subtitles(
+                        ch_entries, format_choice, temp_dir, pb, st_text,
+                        clean_transcript, cookies_path, proxy_url,
+                        target_lang, rate_limit_delay, debug_mode,
+                    )
+                    render_results(sub_files, fails, ch_title, format_choice, combine_choice, temp_dir)
+
+                # ── Playlist / single video branch ─────────────────────────
                 else:
                     if url_type == "both" and download_scope == "Single Video":
                         selected_url, is_playlist = secondary_url, False
@@ -1215,7 +1168,9 @@ def main() -> None:
                         selected_url, is_playlist = primary_url, False
 
                     with st.spinner("Fetching video info…"):
-                        entries, collection_title = get_info(selected_url, is_playlist, cookies_path, proxy_url)
+                        entries, collection_title = get_info(
+                            selected_url, is_playlist, cookies_path, proxy_url
+                        )
 
                     if not entries:
                         st.error("No videos found.")
@@ -1228,7 +1183,10 @@ def main() -> None:
                             target_lang, rate_limit_delay, debug_mode,
                         )
                         effective_combine = combine_choice if is_playlist else "single"
-                        render_results(sub_files, fails, collection_title, format_choice, effective_combine, temp_dir)
+                        render_results(
+                            sub_files, fails, collection_title,
+                            format_choice, effective_combine, temp_dir,
+                        )
 
         except Exception as e:
             st.error(f"Unexpected error: {e}")

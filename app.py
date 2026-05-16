@@ -26,7 +26,6 @@ from io import BytesIO
 from urllib.parse import urlparse, parse_qs
 
 import requests
-from tenacity import retry, stop_after_attempt, wait_exponential
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import sanitize_filename
 
@@ -714,42 +713,105 @@ def _ydl_base_opts(cookies_file, proxy_url) -> dict:
     return opts
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-def get_channel_info(channel_url, cookies_file=None, proxy_url=None):
-    """Fetch all video IDs and titles from a channel."""
-    videos_url = channel_url.rstrip("/")
-    if not videos_url.endswith("/videos"):
-        videos_url += "/videos"
-    opts = {**_ydl_base_opts(cookies_file, proxy_url), "extract_flat": True}
-    with YoutubeDL(opts) as ydl:
-        result = ydl.extract_info(videos_url, download=False)
-    entries = result.get("entries", [])
-    channel_title = result.get("channel", result.get("title", "channel_subtitles"))
-    return (
-        [(e["id"], e.get("title", f"video_{i+1}")) for i, e in enumerate(entries) if e and e.get("id")],
-        channel_title,
-    )
+def _flat_opts(cookies_file, proxy_url) -> dict:
+    """yt-dlp options for flat (metadata-only) extraction, with bot-bypass client."""
+    opts = {
+        **_ydl_base_opts(cookies_file, proxy_url),
+        "extract_flat": True,
+        "ignoreerrors": True,
+        "extractor_args": {"youtube": {"player_client": ["android_vr"]}},
+    }
+    return opts
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-def get_info(url, is_playlist=False, cookies_file=None, proxy_url=None):
-    """Fetch entries for a playlist or single video."""
+def _extract_entries(result) -> list[tuple[str, str]]:
+    """Recursively pull (id, title) pairs out of a yt-dlp result dict."""
+    entries = []
+    raw = result.get("entries", []) if result else []
+    for i, e in enumerate(raw):
+        if not e:
+            continue
+        # Some flat results nest a second level (channel → tab → videos)
+        if e.get("_type") in ("playlist", "url") and not e.get("id"):
+            # recurse one level
+            sub = e.get("entries", [])
+            for j, se in enumerate(sub or []):
+                if se and se.get("id"):
+                    entries.append((se["id"], se.get("title", f"video_{j+1}")))
+        elif e.get("id"):
+            entries.append((e["id"], e.get("title", f"video_{i+1}")))
+    return entries
+
+
+def get_channel_info(channel_url: str, cookies_file=None, proxy_url=None):
+    """
+    Fetch all video IDs and titles from a channel.
+    Tries multiple URL suffixes because channel layouts vary.
+    Surfaces the real yt-dlp error instead of wrapping in RetryError.
+    """
+    base = channel_url.rstrip("/")
+    # Remove any existing tab suffix so we can try our own order
+    for suffix in ("/videos", "/streams", "/shorts", ""):
+        if base.endswith(suffix) and suffix:
+            base = base[: -len(suffix)]
+            break
+
+    candidates = [
+        base + "/videos",
+        base,
+        base + "/streams",
+        base + "/shorts",
+    ]
+
+    last_error = "Could not fetch channel — unknown error"
+    opts = _flat_opts(cookies_file, proxy_url)
+
+    for url_candidate in candidates:
+        try:
+            with YoutubeDL(opts) as ydl:
+                result = ydl.extract_info(url_candidate, download=False)
+            if not result:
+                last_error = f"No data returned for {url_candidate}"
+                continue
+            entries = _extract_entries(result)
+            if not entries:
+                last_error = f"No videos found at {url_candidate}"
+                continue
+            channel_title = result.get("channel") or result.get("title") or "channel_subtitles"
+            return entries, channel_title
+        except Exception as exc:
+            last_error = str(exc)
+            continue
+
+    raise ValueError(f"Could not fetch channel videos. Last error: {last_error}")
+
+
+def get_info(url: str, is_playlist: bool = False, cookies_file=None, proxy_url=None):
+    """
+    Fetch entries for a playlist or single video.
+    Surfaces the real yt-dlp error instead of wrapping in RetryError.
+    """
     if is_playlist:
-        opts = {**_ydl_base_opts(cookies_file, proxy_url), "extract_flat": True}
-        with YoutubeDL(opts) as ydl:
-            result = ydl.extract_info(url, download=False)
-        entries = result.get("entries", [])
-        return (
-            [(e.get("id"), e.get("title", f"video_{i+1}")) for i, e in enumerate(entries) if e and e.get("id")],
-            result.get("title", "playlist_subtitles"),
-        )
+        opts = _flat_opts(cookies_file, proxy_url)
+        try:
+            with YoutubeDL(opts) as ydl:
+                result = ydl.extract_info(url, download=False)
+        except Exception as exc:
+            raise ValueError(f"Could not fetch playlist info: {exc}") from exc
+        entries = _extract_entries(result)
+        title = (result or {}).get("title", "playlist_subtitles")
+        return entries, title
     else:
         video_id = extract_video_id(url)
         if not video_id:
             raise ValueError("Invalid video URL")
         opts = _ydl_base_opts(cookies_file, proxy_url)
-        with YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
+        opts["extractor_args"] = {"youtube": {"player_client": ["android_vr"]}}
+        try:
+            with YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+        except Exception as exc:
+            raise ValueError(f"Could not fetch video info: {exc}") from exc
         return [(video_id, info.get("title", "video_subtitles"))], info.get("title", "video_subtitles")
 
 

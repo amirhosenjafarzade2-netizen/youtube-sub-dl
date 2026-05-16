@@ -104,30 +104,56 @@ def extract_video_id(url):
 
 
 # ── Transcript fetchers ───────────────────────────────────────────────────────
-def get_transcript_api(video_id, format_choice='srt', target_lang='en'):
-    """Primary path: youtube-transcript-api."""
+def get_transcript_api(video_id, format_choice="srt", target_lang="en"):
+    """Primary path: youtube-transcript-api v2+ (instance-based API).
+
+    The old class-method get_transcript() was removed. New flow:
+      api = YouTubeTranscriptApi()
+      fetched = api.fetch(video_id, languages=[...])  -> FetchedTranscript
+    Formatters now accept FetchedTranscript directly.
+    """
     try:
-        if target_lang == 'auto':
-            transcript_data = YouTubeTranscriptApi.get_transcript(video_id)
-            lang_code = transcript_data[0].get('language_code', 'unknown')
-            is_auto = True
+        api = YouTubeTranscriptApi()
+
+        if target_lang == "auto":
+            transcript_list = api.list(video_id)
+            try:
+                transcript = transcript_list.find_manually_created_transcript(
+                    list(LANGUAGE_NAMES.keys())
+                )
+            except NoTranscriptFound:
+                transcript = transcript_list.find_generated_transcript(
+                    list(LANGUAGE_NAMES.keys())
+                )
+            fetched = transcript.fetch()
+            lang_code = transcript.language_code
+            is_auto = transcript.is_generated
         else:
             try:
-                transcript_data = YouTubeTranscriptApi.get_transcript(video_id, languages=[target_lang])
+                fetched = api.fetch(video_id, languages=[target_lang])
                 lang_code = target_lang
                 is_auto = False
             except NoTranscriptFound:
-                transcript_data = YouTubeTranscriptApi.get_transcript(video_id)
-                lang_code = transcript_data[0].get('language_code', 'unknown')
-                is_auto = True
+                transcript_list = api.list(video_id)
+                try:
+                    transcript = transcript_list.find_generated_transcript(
+                        list(LANGUAGE_NAMES.keys())
+                    )
+                except NoTranscriptFound:
+                    transcript = transcript_list.find_manually_created_transcript(
+                        list(LANGUAGE_NAMES.keys())
+                    )
+                fetched = transcript.fetch()
+                lang_code = transcript.language_code
+                is_auto = transcript.is_generated
 
-        dl_format = 'srt' if format_choice == 'txt' else format_choice
-        formatter = WebVTTFormatter() if dl_format == 'vtt' else SRTFormatter()
-        sub_text = formatter.format_transcript(transcript_data)
+        dl_format = "srt" if format_choice == "txt" else format_choice
+        formatter = WebVTTFormatter() if dl_format == "vtt" else SRTFormatter()
+        sub_text = formatter.format_transcript(fetched)
         return sub_text, lang_code, is_auto
 
-    except CouldNotRetrieveTranscript as e:
-        raise ValueError(f"Access denied (age-restricted?): {str(e)}")
+    except (CouldNotRetrieveTranscript, NoTranscriptFound) as e:
+        raise ValueError(f"No transcript available: {str(e)}")
     except Exception as e:
         raise ValueError(f"API error: {str(e)}")
 

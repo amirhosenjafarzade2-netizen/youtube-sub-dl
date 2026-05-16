@@ -714,14 +714,12 @@ def _ydl_base_opts(cookies_file, proxy_url) -> dict:
 
 
 def _flat_opts(cookies_file, proxy_url) -> dict:
-    """yt-dlp options for flat (metadata-only) extraction, with bot-bypass client."""
-    opts = {
+    """yt-dlp options for flat (metadata-only) extraction."""
+    return {
         **_ydl_base_opts(cookies_file, proxy_url),
         "extract_flat": True,
         "ignoreerrors": True,
-        "extractor_args": {"youtube": {"player_client": ["android_vr"]}},
     }
-    return opts
 
 
 def _extract_entries(result) -> list[tuple[str, str]]:
@@ -763,25 +761,31 @@ def get_channel_info(channel_url: str, cookies_file=None, proxy_url=None):
         base + "/shorts",
     ]
 
+    clients_no_cookies = ["mweb", "ios", "android_vr", "web"]
+    clients_with_cookies = clients_no_cookies + ["tv_downgraded", "web_safari"]
+    clients = clients_with_cookies if (cookies_file and os.path.isfile(cookies_file)) else clients_no_cookies
+
     last_error = "Could not fetch channel — unknown error"
-    opts = _flat_opts(cookies_file, proxy_url)
 
     for url_candidate in candidates:
-        try:
-            with YoutubeDL(opts) as ydl:
-                result = ydl.extract_info(url_candidate, download=False)
-            if not result:
-                last_error = f"No data returned for {url_candidate}"
+        for client in clients:
+            opts = _flat_opts(cookies_file, proxy_url)
+            opts["extractor_args"] = {"youtube": {"player_client": [client]}}
+            try:
+                with YoutubeDL(opts) as ydl:
+                    result = ydl.extract_info(url_candidate, download=False)
+                if not result:
+                    last_error = f"No data returned for {url_candidate} (client={client})"
+                    continue
+                entries = _extract_entries(result)
+                if not entries:
+                    last_error = f"No videos found at {url_candidate} (client={client})"
+                    continue
+                channel_title = result.get("channel") or result.get("title") or "channel_subtitles"
+                return entries, channel_title
+            except Exception as exc:
+                last_error = f"[{client}] {url_candidate}: {exc}"
                 continue
-            entries = _extract_entries(result)
-            if not entries:
-                last_error = f"No videos found at {url_candidate}"
-                continue
-            channel_title = result.get("channel") or result.get("title") or "channel_subtitles"
-            return entries, channel_title
-        except Exception as exc:
-            last_error = str(exc)
-            continue
 
     raise ValueError(f"Could not fetch channel videos. Last error: {last_error}")
 
@@ -789,30 +793,46 @@ def get_channel_info(channel_url: str, cookies_file=None, proxy_url=None):
 def get_info(url: str, is_playlist: bool = False, cookies_file=None, proxy_url=None):
     """
     Fetch entries for a playlist or single video.
-    Surfaces the real yt-dlp error instead of wrapping in RetryError.
+    Tries multiple player clients so one broken client does not abort the request.
     """
+    # mweb and ios are more stable than android_vr for metadata fetching
+    clients_no_cookies = ["mweb", "ios", "android_vr", "web"]
+    clients_with_cookies = clients_no_cookies + ["tv_downgraded", "web_safari"]
+    clients = clients_with_cookies if (cookies_file and os.path.isfile(cookies_file)) else clients_no_cookies
+
     if is_playlist:
-        opts = _flat_opts(cookies_file, proxy_url)
-        try:
-            with YoutubeDL(opts) as ydl:
-                result = ydl.extract_info(url, download=False)
-        except Exception as exc:
-            raise ValueError(f"Could not fetch playlist info: {exc}") from exc
-        entries = _extract_entries(result)
-        title = (result or {}).get("title", "playlist_subtitles")
-        return entries, title
+        last_error = "Could not fetch playlist info"
+        for client in clients:
+            opts = _flat_opts(cookies_file, proxy_url)
+            opts["extractor_args"] = {"youtube": {"player_client": [client]}}
+            try:
+                with YoutubeDL(opts) as ydl:
+                    result = ydl.extract_info(url, download=False)
+                if result:
+                    return _extract_entries(result), result.get("title", "playlist_subtitles")
+                last_error = f"No data returned (client={client})"
+            except Exception as exc:
+                last_error = f"[{client}] {exc}"
+                continue
+        raise ValueError(last_error)
     else:
         video_id = extract_video_id(url)
         if not video_id:
             raise ValueError("Invalid video URL")
-        opts = _ydl_base_opts(cookies_file, proxy_url)
-        opts["extractor_args"] = {"youtube": {"player_client": ["android_vr"]}}
-        try:
-            with YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-        except Exception as exc:
-            raise ValueError(f"Could not fetch video info: {exc}") from exc
-        return [(video_id, info.get("title", "video_subtitles"))], info.get("title", "video_subtitles")
+        last_error = "Could not fetch video info"
+        for client in clients:
+            opts = _ydl_base_opts(cookies_file, proxy_url)
+            opts["extractor_args"] = {"youtube": {"player_client": [client]}}
+            try:
+                with YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                if info:
+                    return [(video_id, info.get("title", "video_subtitles"))], info.get("title", "video_subtitles")
+                last_error = f"No data returned (client={client})"
+            except Exception as exc:
+                last_error = f"[{client}] {exc}"
+                continue
+        raise ValueError(last_error)
 
 
 # ── Text processing ────────────────────────────────────────────────────────────

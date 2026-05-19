@@ -422,12 +422,43 @@ def main():
         playlist_url = None
         video_url_parsed = None
 
+        # Channel video range controls (only shown for channel URLs)
+        channel_video_scope = "All Videos"
+        channel_range_start = 1
+        channel_range_end = 50
+
         if url:
             try:
                 playlist_url, video_url_parsed, url_type = validate_url(url)
 
                 if url_type == 'channel':
                     st.info("📺 Channel URL detected — will fetch all uploaded videos.")
+
+                    # --- Channel video range selection ---
+                    st.markdown("---")
+                    st.subheader("📋 Video Selection")
+                    channel_video_scope = st.radio(
+                        "Which videos to download?",
+                        ["All Videos", "Range (oldest → newest)"],
+                        key="channel_scope"
+                    )
+                    if channel_video_scope == "Range (oldest → newest)":
+                        st.caption(
+                            "Videos are numbered oldest=1, newest=last. "
+                            "Enter the start and end video numbers (inclusive)."
+                        )
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            channel_range_start = st.number_input(
+                                "From (video #)", min_value=1, value=1, step=1, key="range_start"
+                            )
+                        with col2:
+                            channel_range_end = st.number_input(
+                                "To (video #)", min_value=1, value=50, step=1, key="range_end"
+                            )
+                        if channel_range_start > channel_range_end:
+                            st.warning("⚠️ 'From' must be ≤ 'To'.")
+                    st.markdown("---")
 
                 if url_type == 'both':
                     download_scope = st.selectbox("Scope", ["Entire Playlist", "Single Video"], key="scope")
@@ -474,7 +505,7 @@ def main():
 
         with st.spinner("Fetching video list..."):
             try:
-                entries, _ = get_info(selected_url, is_playlist, cookies_file)
+                entries, playlist_title = get_info(selected_url, is_playlist, cookies_file)
             except Exception as e:
                 st.error(f"Could not fetch video list: {str(e)}")
                 return
@@ -482,6 +513,30 @@ def main():
         if not entries:
             st.error("No videos found at this URL.")
             return
+
+        # --- Channel range filtering ---
+        # YouTube channels return videos newest-first; reverse so index 1 = oldest.
+        if url_type == 'channel':
+            entries = list(reversed(entries))
+            if channel_video_scope == "Range (oldest → newest)":
+                if channel_range_start > channel_range_end:
+                    st.error("'From' video number must be ≤ 'To' video number.")
+                    return
+                total_available = len(entries)
+                # Clamp to available range
+                start_idx = channel_range_start - 1          # 0-based
+                end_idx = min(channel_range_end, total_available)  # inclusive end, 1-based → exclusive slice
+                if start_idx >= total_available:
+                    st.error(
+                        f"Start video #{channel_range_start} exceeds total channel videos ({total_available}). "
+                        "Please enter a smaller number."
+                    )
+                    return
+                entries = entries[start_idx:end_idx]
+                st.info(
+                    f"📋 Downloading subtitles for videos **#{channel_range_start}–#{min(channel_range_end, total_available)}** "
+                    f"(oldest → newest) out of **{total_available}** total videos."
+                )
 
         total_videos = len(entries)
         st.write(f"Found **{total_videos}** video(s). Starting download...")
@@ -542,17 +597,17 @@ def main():
 
                 # --- Output ---
                 if download_videos:
-                    zip_buffer, zip_name = create_video_zip(video_files, subtitle_files, _)
+                    zip_buffer, zip_name = create_video_zip(video_files, subtitle_files, playlist_title)
                     st.download_button("📦 Download Videos + Subs ZIP", zip_buffer, zip_name, "application/zip")
 
                 elif is_playlist:
                     if combine_choice == 'combined':
-                        combined = combine_subtitles(subtitle_files, temp_dir, _, format_choice)
+                        combined = combine_subtitles(subtitle_files, temp_dir, playlist_title, format_choice)
                         with open(combined, 'rb') as f:
                             st.download_button("📄 Download Combined File", f.read(),
                                                os.path.basename(combined), mime_type)
                     else:
-                        zip_buffer, zip_name = create_zip(subtitle_files, _, format_choice)
+                        zip_buffer, zip_name = create_zip(subtitle_files, playlist_title, format_choice)
                         st.download_button("📦 Download ZIP", zip_buffer, zip_name, "application/zip")
 
                 else:

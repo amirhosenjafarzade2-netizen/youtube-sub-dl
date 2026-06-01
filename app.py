@@ -466,6 +466,8 @@ def main():
                     st.session_state.multi_urls.append("")
                     st.rerun()
 
+            multi_combine_choice = st.selectbox("Output", ["separate", "combined"], key="multi_combine")
+
             st.markdown("---")
             url = None  # not used in multi-video mode
 
@@ -658,10 +660,16 @@ def main():
                     zip_buffer, zip_name = create_video_zip(video_files, subtitle_files, "multi_video")
                     st.download_button("📦 Download Videos + Subs ZIP", zip_buffer, zip_name, "application/zip")
                 elif total_videos == 1 and subtitle_files:
+                    # Single video — always just one file
                     _, sub_text = subtitle_files[0]
                     fname = f"{sanitize_filename(subtitle_files[0][0])[:150]}.{format_choice}"
                     st.download_button("📄 Download Subtitle File",
                                        sub_text.encode('utf-8'), fname, mime_type)
+                elif multi_combine_choice == "combined":
+                    combined = combine_subtitles(subtitle_files, temp_dir, "multi_video", format_choice)
+                    with open(combined, "rb") as f:
+                        st.download_button("📄 Download Combined File", f.read(),
+                                           os.path.basename(combined), mime_type)
                 else:
                     zip_buffer, zip_name = create_zip(subtitle_files, "multi_video", format_choice)
                     st.download_button("📦 Download ZIP", zip_buffer, zip_name, "application/zip")

@@ -505,7 +505,7 @@ def main():
                                disabled=not download_videos)
         selected_quality = quality_options[quality]
 
-        # Defaults (only used in single/playlist/channel mode)
+        # Defaults (only used in playlist/channel mode)
         combine_choice = "separate"
         download_scope = "Entire Playlist"
         url_type = None

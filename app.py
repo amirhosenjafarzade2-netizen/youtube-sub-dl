@@ -428,7 +428,7 @@ def main():
         # ── Mode selector ──────────────────────────────────────────────────────
         mode = st.radio(
             "Download Mode",
-            ["Single / Playlist / Channel", "Multi-Video"],
+            ["Playlist / Channel", "single / Multi-Video"],
             key="download_mode",
             horizontal=True,
         )
@@ -505,7 +505,7 @@ def main():
                                disabled=not download_videos)
         selected_quality = quality_options[quality]
 
-        # Defaults (only used in playlist/channel mode)
+        # Defaults (only used in single/playlist/channel mode)
         combine_choice = "separate"
         download_scope = "Entire Playlist"
         url_type = None

@@ -434,7 +434,7 @@ def main():
         )
 
         # ── Multi-Video URL inputs ─────────────────────────────────────────────
-        if mode == "Multi-Video":
+        if mode == "single / Multi-Video":
             st.markdown("---")
             st.subheader("🎬 Video URLs")
             st.caption("Add one video URL per field. Click **＋ Add video** to add more.")
@@ -515,7 +515,7 @@ def main():
         channel_range_start = 1
         channel_range_end = 50
 
-        if mode != "Multi-Video" and url:
+        if mode != "single / Multi-Video" and url:
             try:
                 playlist_url, video_url_parsed, url_type = validate_url(url)
 
@@ -563,7 +563,7 @@ def main():
     if st.button(button_text, type="primary"):
 
         # ── Multi-Video mode ──────────────────────────────────────────────────
-        if mode == "Multi-Video":
+        if mode == "single / Multi-Video":
             raw_urls = [u.strip() for u in st.session_state.get("multi_urls", []) if u.strip()]
             if not raw_urls:
                 st.error("Please enter at least one video URL.")

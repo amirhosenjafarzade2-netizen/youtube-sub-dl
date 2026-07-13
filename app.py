@@ -3,8 +3,10 @@ import os
 import zipfile
 import re
 import glob
+import time
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 import urllib.request
+import urllib.error
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import sanitize_filename
 import tempfile
@@ -214,23 +216,51 @@ def vtt_to_srt(vtt_text):
             counter += 1
     return '\n'.join(srt_blocks) + '\n'
 
-def _fetch_translated_caption_text(base_url, tlang='en'):
+_LAST_TRANSLATE_REQUEST_TIME = [0.0]
+_TRANSLATE_MIN_INTERVAL = 1.5  # seconds enforced between consecutive translate requests,
+                                # process-wide, regardless of which loop is calling this
+
+def _pace_translate_requests():
+    elapsed = time.monotonic() - _LAST_TRANSLATE_REQUEST_TIME[0]
+    if elapsed < _TRANSLATE_MIN_INTERVAL:
+        time.sleep(_TRANSLATE_MIN_INTERVAL - elapsed)
+    _LAST_TRANSLATE_REQUEST_TIME[0] = time.monotonic()
+
+def _fetch_translated_caption_text(base_url, tlang='en', max_retries=5):
     """Manually request YouTube's on-the-fly caption translation (tlang param) for a
-    given caption track URL, bypassing yt-dlp's own list of pre-known languages."""
+    given caption track URL, bypassing yt-dlp's own list of pre-known languages.
+    Paces requests and retries with backoff on HTTP 429 (rate limiting)."""
     parsed = urlparse(base_url)
     qs = parse_qs(parsed.query)
     qs['tlang'] = [tlang]
     qs['fmt'] = ['vtt']
     new_query = urlencode(qs, doseq=True)
     new_url = urlunparse(parsed._replace(query=new_query))
-    req = urllib.request.Request(new_url, headers={
+    headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    })
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        raw = resp.read().decode('utf-8', errors='replace')
-    if not raw.strip():
-        raise ValueError("YouTube returned an empty translated caption track.")
-    return raw
+    }
+
+    for attempt in range(max_retries):
+        _pace_translate_requests()
+        req = urllib.request.Request(new_url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                raw = resp.read().decode('utf-8', errors='replace')
+            if not raw.strip():
+                raise ValueError("YouTube returned an empty translated caption track.")
+            return raw
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                if attempt < max_retries - 1:
+                    backoff = min(2 ** attempt * 3, 45)
+                    time.sleep(backoff)
+                    continue
+                raise ValueError(
+                    "YouTube rate-limited the translation requests (HTTP 429) after several "
+                    "retries. Try again in a few minutes, or download fewer videos at once."
+                )
+            raise ValueError(f"HTTP {e.code} fetching translated captions: {e.reason}")
+    raise ValueError("Failed to fetch translated captions after multiple retries.")
 
 def get_subtitles_yt_dlp(video_url, format_choice, cookies_file, temp_dir, mode='original'):
     dl_format = 'srt' if format_choice == 'txt' else format_choice
@@ -254,6 +284,7 @@ def get_subtitles_yt_dlp(video_url, format_choice, cookies_file, temp_dir, mode=
     auto = info.get('automatic_captions') or {}
 
     def _download_lang(lang_code):
+        _pace_translate_requests()
         ydl_opts = {**base_opts, 'subtitleslangs': [lang_code], 'automaticsubslangs': [lang_code],
                     'subtitlesformat': f'{dl_format}/vtt/srv3/srv1/best'}
         with YoutubeDL(ydl_opts) as ydl:

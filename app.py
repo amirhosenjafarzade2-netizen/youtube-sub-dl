@@ -3,7 +3,8 @@ import os
 import zipfile
 import re
 import glob
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+import urllib.request
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import sanitize_filename
 import tempfile
@@ -187,6 +188,50 @@ def get_transcript_api(video_id, format_choice='srt', mode='original'):
     except Exception as e:
         raise ValueError(f"API error: {str(e)}")
 
+def vtt_to_srt(vtt_text):
+    """Convert WebVTT cue text into SRT format (numbered cues, comma decimal separator)."""
+    body = re.sub(r'^WEBVTT.*?\n', '', vtt_text, count=1, flags=re.DOTALL)
+    blocks = re.split(r'\n\s*\n', body.strip())
+    time_pattern = re.compile(r'(\d{2}:\d{2}:\d{2})[.,](\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2})[.,](\d{3})')
+    srt_blocks = []
+    counter = 1
+    for block in blocks:
+        m = time_pattern.search(block)
+        if not m:
+            continue
+        start = f"{m.group(1)},{m.group(2)}"
+        end = f"{m.group(3)},{m.group(4)}"
+        text_lines = []
+        for line in block.split('\n'):
+            if time_pattern.search(line) or not line.strip():
+                continue
+            if line.strip().upper().startswith(('NOTE', 'STYLE', 'KIND:', 'LANGUAGE:')):
+                continue
+            line = re.sub(r'<[^>]+>', '', line)  # strip vtt tags like <c> and word timestamps
+            text_lines.append(line)
+        if text_lines:
+            srt_blocks.append(f"{counter}\n{start} --> {end}\n" + '\n'.join(text_lines) + "\n")
+            counter += 1
+    return '\n'.join(srt_blocks) + '\n'
+
+def _fetch_translated_caption_text(base_url, tlang='en'):
+    """Manually request YouTube's on-the-fly caption translation (tlang param) for a
+    given caption track URL, bypassing yt-dlp's own list of pre-known languages."""
+    parsed = urlparse(base_url)
+    qs = parse_qs(parsed.query)
+    qs['tlang'] = [tlang]
+    qs['fmt'] = ['vtt']
+    new_query = urlencode(qs, doseq=True)
+    new_url = urlunparse(parsed._replace(query=new_query))
+    req = urllib.request.Request(new_url, headers={
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    })
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        raw = resp.read().decode('utf-8', errors='replace')
+    if not raw.strip():
+        raise ValueError("YouTube returned an empty translated caption track.")
+    return raw
+
 def get_subtitles_yt_dlp(video_url, format_choice, cookies_file, temp_dir, mode='original'):
     dl_format = 'srt' if format_choice == 'txt' else format_choice
     base_opts = {
@@ -202,29 +247,56 @@ def get_subtitles_yt_dlp(video_url, format_choice, cookies_file, temp_dir, mode=
         'ignoreerrors': True,
     }
 
-    if mode == 'en_translation':
-        # YouTube exposes machine-translated caption tracks (any spoken language -> English)
-        # through automatic_captions, keyed by the target language code. Translated tracks
-        # aren't always offered in srt, so ask for a format preference list instead of
-        # forcing dl_format, and then accept whichever subtitle extension actually landed.
-        ydl_opts = {**base_opts, 'subtitleslangs': ['en'], 'automaticsubslangs': ['en'],
+    probe_opts = {'quiet': True, 'no_warnings': True, 'cookiefile': cookies_file, 'skip_download': True}
+    with YoutubeDL(probe_opts) as ydl:
+        info = ydl.extract_info(video_url, download=False)
+    manual = info.get('subtitles') or {}
+    auto = info.get('automatic_captions') or {}
+
+    def _download_lang(lang_code):
+        ydl_opts = {**base_opts, 'subtitleslangs': [lang_code], 'automaticsubslangs': [lang_code],
                     'subtitlesformat': f'{dl_format}/vtt/srv3/srv1/best'}
         with YoutubeDL(ydl_opts) as ydl:
             ydl.download([video_url])
-        files = []
+        found = []
         for ext in [dl_format, 'vtt', 'ttml', 'srv3', 'srv2', 'srv1', 'json3']:
-            files += glob.glob(os.path.join(temp_dir, f'*.en.{ext}'))
-        target_code = 'en'
-    else:
-        # 'original': figure out which language the video's captions are actually in first
-        probe_opts = {'quiet': True, 'no_warnings': True, 'cookiefile': cookies_file,
-                      'skip_download': True}
-        with YoutubeDL(probe_opts) as ydl:
-            info = ydl.extract_info(video_url, download=False)
-        manual = info.get('subtitles') or {}
-        auto = info.get('automatic_captions') or {}
-        native_lang = info.get('language')
+            found += glob.glob(os.path.join(temp_dir, f'*.{lang_code}.{ext}'))
+        return found
 
+    if mode == 'en_translation':
+        # 1) If yt-dlp already lists a ready-made 'en' track (native or pre-listed
+        #    translation), just grab it - this is the cheap, reliable path.
+        if 'en' in manual or 'en' in auto:
+            files = _download_lang('en')
+            if files:
+                sub_path = files[0]
+                with open(sub_path, 'r', encoding='utf-8') as f:
+                    sub_text = f.read()
+                os.remove(sub_path)
+                if sub_path.endswith('.vtt') and format_choice != 'txt' and format_choice == 'srt':
+                    sub_text = vtt_to_srt(sub_text)
+                is_auto = 'en' not in manual
+                return sub_text, 'en', is_auto
+
+        # 2) yt-dlp didn't surface an 'en' key - fall back to manually requesting
+        #    YouTube's translate-on-demand (tlang=en) on whatever auto-caption track
+        #    does exist. This is what actually gets you the "auto-translate to English"
+        #    option you see in the YouTube web player, even when yt-dlp doesn't list it.
+        if auto:
+            base_lang = next(iter(auto.keys()))
+            track_list = auto[base_lang]
+            base_track_url = next((t.get('url') for t in track_list if t.get('ext') == 'vtt'), None)
+            if not base_track_url and track_list:
+                base_track_url = track_list[0].get('url')
+            if base_track_url:
+                vtt_text = _fetch_translated_caption_text(base_track_url, tlang='en')
+                sub_text = vtt_to_srt(vtt_text) if format_choice == 'srt' else vtt_text
+                return sub_text, 'en', True
+
+        raise ValueError("No English transcript or translatable auto-caption track found for this video.")
+
+    else:  # 'original'
+        native_lang = info.get('language')
         lang_code = None
         if native_lang and (native_lang in manual or native_lang in auto):
             lang_code = native_lang
@@ -236,23 +308,20 @@ def get_subtitles_yt_dlp(video_url, format_choice, cookies_file, temp_dir, mode=
         if not lang_code:
             raise ValueError("No subtitles found")
 
-        ydl_opts = {**base_opts, 'subtitleslangs': [lang_code], 'automaticsubslangs': [lang_code],
-                    'subtitlesformat': dl_format}
-        with YoutubeDL(ydl_opts) as ydl:
-            ydl.download([video_url])
-        files = (glob.glob(os.path.join(temp_dir, f'*.{lang_code}.{dl_format}')) +
-                 glob.glob(os.path.join(temp_dir, f'*.{lang_code}.vtt')))
-        target_code = lang_code
+        files = _download_lang(lang_code)
+        if not files:
+            raise ValueError("No subtitles found")
 
-    if files:
         sub_path = files[0]
         with open(sub_path, 'r', encoding='utf-8') as f:
             sub_text = f.read()
         os.remove(sub_path)
-        is_auto = (mode == 'en_translation') or ('auto' in sub_path.lower())
-        return sub_text, target_code, is_auto
-    else:
-        raise ValueError("No subtitles found")
+        if sub_path.endswith('.vtt') and format_choice == 'srt':
+            sub_text = vtt_to_srt(sub_text)
+        is_auto = lang_code not in manual
+        return sub_text, lang_code, is_auto
+
+
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def get_info(url, is_playlist=False, cookies_file=None):

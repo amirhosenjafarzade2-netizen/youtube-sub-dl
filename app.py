@@ -53,7 +53,7 @@ LANGUAGE_NAMES = {
 }
 
 def format_language_option(code):
-    return LANGUAGE_NAMES.get(code, code.upper())
+    return LANGUAGE_NAMES.get(code, code.upper() if code else 'Unknown')
 
 def is_channel_url(url):
     try:
@@ -126,21 +126,46 @@ def get_video_metadata(url, cookies_file=None):
         channel = info.get('channel', info.get('uploader', 'Unknown Channel'))
         return title, channel
 
-def get_transcript_api(video_id, format_choice='srt', target_lang='en'):
+def _pick_original_transcript(transcript_list):
+    """Prefer a manually-uploaded (creator-added) transcript since that's always in
+    the video's native language. Otherwise fall back to the auto-generated transcript,
+    which is also always in the video's spoken/original language."""
+    manual = [t for t in transcript_list if not t.is_generated]
+    if manual:
+        return manual[0]
+    generated = [t for t in transcript_list if t.is_generated]
+    if generated:
+        return generated[0]
+    raise ValueError("No transcript available for this video.")
+
+def get_transcript_api(video_id, format_choice='srt', mode='original'):
+    """
+    mode:
+      'original'       -> fetch the transcript in the video's native/original language
+      'en_translation' -> fetch an English transcript, translating on the fly if needed
+    """
     try:
-        if target_lang == 'auto':
-            transcript_data = YouTubeTranscriptApi.get_transcript(video_id)
-            lang_code = transcript_data[0].get('language', 'unknown')
-            is_auto = True
-        else:
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+
+        if mode == 'en_translation':
             try:
-                transcript_data = YouTubeTranscriptApi.get_transcript(video_id, languages=[target_lang])
-                lang_code = target_lang
-                is_auto = False
+                transcript = transcript_list.find_transcript(['en'])
+                is_auto = transcript.is_generated
             except NoTranscriptFound:
-                transcript_data = YouTubeTranscriptApi.get_transcript(video_id)
-                lang_code = transcript_data[0].get('language', 'unknown')
+                base_transcript = _pick_original_transcript(transcript_list)
+                if not base_transcript.is_translatable:
+                    raise ValueError(
+                        "No English transcript exists and this track can't be machine-translated."
+                    )
+                transcript = base_transcript.translate('en')
                 is_auto = True
+            lang_code = 'en'
+        else:  # 'original'
+            transcript = _pick_original_transcript(transcript_list)
+            lang_code = transcript.language_code
+            is_auto = transcript.is_generated
+
+        transcript_data = transcript.fetch()
 
         if format_choice == 'srt':
             formatter = SRTFormatter()
@@ -157,9 +182,9 @@ def get_transcript_api(video_id, format_choice='srt', target_lang='en'):
     except Exception as e:
         raise ValueError(f"API error: {str(e)}")
 
-def get_subtitles_yt_dlp(video_url, format_choice, cookies_file, temp_dir, target_lang='en'):
+def get_subtitles_yt_dlp(video_url, format_choice, cookies_file, temp_dir, mode='original'):
     dl_format = 'srt' if format_choice == 'txt' else format_choice
-    ydl_opts = {
+    base_opts = {
         'writesubtitles': True,
         'writeautomaticsub': True,
         'skip_download': True,
@@ -171,44 +196,55 @@ def get_subtitles_yt_dlp(video_url, format_choice, cookies_file, temp_dir, targe
         'restrict_filenames': True,
         'ignoreerrors': True,
     }
-    if target_lang != 'auto':
-        ydl_opts['subtitleslangs'] = [target_lang]
-        ydl_opts['automaticsubslangs'] = [target_lang]
-        ydl_opts['subtitlesformat'] = dl_format
-    else:
-        ydl_opts['subtitleslangs'] = ['en', 'tr']
-        ydl_opts['automaticsubslangs'] = ['en', 'tr']
-        ydl_opts['subtitlesformat'] = dl_format
 
-    with YoutubeDL(ydl_opts) as ydl:
-        try:
+    if mode == 'en_translation':
+        # YouTube exposes machine-translated caption tracks (any spoken language -> English)
+        # through automatic_captions, keyed by the target language code.
+        ydl_opts = {**base_opts, 'subtitleslangs': ['en'], 'automaticsubslangs': ['en'],
+                    'subtitlesformat': dl_format}
+        with YoutubeDL(ydl_opts) as ydl:
             ydl.download([video_url])
-            if target_lang != 'auto':
-                files = (
-                    glob.glob(os.path.join(temp_dir, f'*.{target_lang}.{dl_format}')) +
-                    glob.glob(os.path.join(temp_dir, f'*.{target_lang}.vtt'))
-                )
-            else:
-                files = (
-                    glob.glob(os.path.join(temp_dir, '*.en.srt')) +
-                    glob.glob(os.path.join(temp_dir, '*.en.vtt')) +
-                    glob.glob(os.path.join(temp_dir, '*.tr.srt')) +
-                    glob.glob(os.path.join(temp_dir, '*.tr.vtt'))
-                )
-            if files:
-                sub_path = files[0]
-                with open(sub_path, 'r', encoding='utf-8') as f:
-                    sub_text = f.read()
-                os.remove(sub_path)
-                lang_code = target_lang if target_lang != 'auto' else (
-                    'en' if '.en.' in sub_path else 'tr' if '.tr.' in sub_path else 'unknown'
-                )
-                is_auto = 'auto' in sub_path.lower()
-                return sub_text, lang_code, is_auto
-            else:
-                raise ValueError("No subtitles found")
-        except Exception as e:
-            raise ValueError(f"yt-dlp error: {str(e)}")
+        files = (glob.glob(os.path.join(temp_dir, f'*.en.{dl_format}')) +
+                 glob.glob(os.path.join(temp_dir, '*.en.vtt')))
+        target_code = 'en'
+    else:
+        # 'original': figure out which language the video's captions are actually in first
+        probe_opts = {'quiet': True, 'no_warnings': True, 'cookiefile': cookies_file,
+                      'skip_download': True}
+        with YoutubeDL(probe_opts) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+        manual = info.get('subtitles') or {}
+        auto = info.get('automatic_captions') or {}
+        native_lang = info.get('language')
+
+        lang_code = None
+        if native_lang and (native_lang in manual or native_lang in auto):
+            lang_code = native_lang
+        elif manual:
+            lang_code = next(iter(manual.keys()))
+        elif auto:
+            lang_code = next(iter(auto.keys()))
+
+        if not lang_code:
+            raise ValueError("No subtitles found")
+
+        ydl_opts = {**base_opts, 'subtitleslangs': [lang_code], 'automaticsubslangs': [lang_code],
+                    'subtitlesformat': dl_format}
+        with YoutubeDL(ydl_opts) as ydl:
+            ydl.download([video_url])
+        files = (glob.glob(os.path.join(temp_dir, f'*.{lang_code}.{dl_format}')) +
+                 glob.glob(os.path.join(temp_dir, f'*.{lang_code}.vtt')))
+        target_code = lang_code
+
+    if files:
+        sub_path = files[0]
+        with open(sub_path, 'r', encoding='utf-8') as f:
+            sub_text = f.read()
+        os.remove(sub_path)
+        is_auto = (mode == 'en_translation') or ('auto' in sub_path.lower())
+        return sub_text, target_code, is_auto
+    else:
+        raise ValueError("No subtitles found")
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def get_info(url, is_playlist=False, cookies_file=None):
@@ -342,7 +378,7 @@ def download_videos_yt_dlp(entries, url, quality, cookies_file, temp_dir, progre
 
 @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=1, max=10))
 def download_subtitles(url, format_choice, temp_dir, is_playlist, progress_bar, total_videos,
-                       clean_transcript, cookies_file=None, target_lang='en'):
+                       clean_transcript, cookies_file=None, sub_mode='original'):
     subtitle_files = []
     entries, title = get_info(url, is_playlist, cookies_file)
     if not entries:
@@ -353,11 +389,11 @@ def download_subtitles(url, format_choice, temp_dir, is_playlist, progress_bar, 
         video_url = f"https://www.youtube.com/watch?v={video_id}"
         try:
             try:
-                sub_text, lang_code, is_auto = get_transcript_api(video_id, format_choice, target_lang)
+                sub_text, lang_code, is_auto = get_transcript_api(video_id, format_choice, sub_mode)
                 fallback_used = False
             except Exception:
                 sub_text, lang_code, is_auto = get_subtitles_yt_dlp(
-                    video_url, format_choice, cookies_file, temp_dir, target_lang)
+                    video_url, format_choice, cookies_file, temp_dir, sub_mode)
                 fallback_used = True
                 if not cookies_file:
                     st.info(f"Used yt-dlp fallback for '{video_title}'")
@@ -419,7 +455,7 @@ def prepend_video_header(sub_text, video_title, channel_name):
 def main():
     st.set_page_config(page_title="YouTube Subtitle Downloader", page_icon="🎥", layout="wide")
     st.title("YouTube Subtitle Downloader 🎥")
-    st.markdown("Download subtitles from YouTube videos, playlists, and channels! Supports Turkish/EN and more.")
+    st.markdown("Download subtitles from YouTube videos, playlists, and channels!")
 
     # --- Sidebar ---
     with st.sidebar:
@@ -428,10 +464,18 @@ def main():
         # ── Mode selector ──────────────────────────────────────────────────────
         mode = st.radio(
             "Download Mode",
-            ["Playlist / Channel", "single / Multi-Video"],
+            ["Playlist / Channel", "single / Multi-Video", "Channel + Keyword"],
             key="download_mode",
             horizontal=True,
         )
+
+        # Defaults so these names always exist regardless of chosen mode
+        url = None
+        keyword_channel_url = None
+        keyword_filter = None
+        keyword_case_sensitive = False
+        keyword_combine_choice = "separate"
+        multi_combine_choice = "separate"
 
         # ── Multi-Video URL inputs ─────────────────────────────────────────────
         if mode == "single / Multi-Video":
@@ -469,7 +513,18 @@ def main():
             multi_combine_choice = st.selectbox("Output", ["separate", "combined"], key="multi_combine")
 
             st.markdown("---")
-            url = None  # not used in multi-video mode
+
+        elif mode == "Channel + Keyword":
+            st.markdown("---")
+            st.subheader("🔎 Channel + Keyword Filter")
+            st.caption("Only videos whose title contains the keyword will have their subtitles downloaded.")
+            keyword_channel_url = st.text_input(
+                "Channel URL", placeholder="https://www.youtube.com/@channelname"
+            )
+            keyword_filter = st.text_input("Keyword", placeholder="e.g. Interview")
+            keyword_case_sensitive = st.checkbox("Case-sensitive match", value=False)
+            keyword_combine_choice = st.selectbox("Output", ["separate", "combined"], key="keyword_combine")
+            st.markdown("---")
 
         else:
             url = st.text_input("YouTube URL", placeholder="Paste video, playlist, or channel URL...")
@@ -491,10 +546,16 @@ def main():
         format_choice = st.selectbox("Subtitle Format", ["srt", "vtt", "txt"])
         clean_transcript = st.checkbox("Clean Transcript", value=True)
 
-        target_display = st.radio("Target Language", ['English', 'Turkish', 'Auto'], horizontal=True)
-        target_lang = {'English': 'en', 'Turkish': 'tr', 'Auto': 'auto'}[target_display]
+        lang_mode_display = st.radio(
+            "Subtitle Language", ['Original Language', 'English Translation'], horizontal=True
+        )
+        sub_mode = {'Original Language': 'original', 'English Translation': 'en_translation'}[lang_mode_display]
 
-        download_videos = st.checkbox("Download Videos Too", value=False)
+        download_videos = st.checkbox(
+            "Download Videos Too", value=False,
+            disabled=(mode == "Channel + Keyword"),
+            help="Not available in Channel + Keyword mode." if mode == "Channel + Keyword" else None,
+        )
         quality_options = {
             "Best Quality": "best",
             "720p": "best[height<=720]",
@@ -515,7 +576,7 @@ def main():
         channel_range_start = 1
         channel_range_end = 50
 
-        if mode != "single / Multi-Video" and url:
+        if mode == "Playlist / Channel" and url:
             try:
                 playlist_url, video_url_parsed, url_type = validate_url(url)
 
@@ -562,6 +623,104 @@ def main():
     button_text = "⬇️ Download Videos & Subtitles" if download_videos else "⬇️ Download Subtitles"
     if st.button(button_text, type="primary"):
 
+        # ── Channel + Keyword mode ──────────────────────────────────────────────
+        if mode == "Channel + Keyword":
+            if not keyword_channel_url or not keyword_channel_url.strip():
+                st.error("Please enter a channel URL.")
+                return
+            if not keyword_filter or not keyword_filter.strip():
+                st.error("Please enter a keyword to filter by.")
+                return
+
+            try:
+                channel_url_norm, _, utype = validate_url(keyword_channel_url.strip())
+            except ValueError as ve:
+                st.error(str(ve))
+                return
+            if utype != 'channel':
+                st.error("That doesn't look like a channel URL. Use a /@handle, /c/, /channel/, or /user/ URL.")
+                return
+
+            with st.spinner("Fetching channel video list..."):
+                try:
+                    entries, channel_title = get_info(channel_url_norm, True, cookies_file)
+                except Exception as e:
+                    st.error(f"Could not fetch video list: {str(e)}")
+                    return
+
+            if not entries:
+                st.error("No videos found on this channel.")
+                return
+
+            needle = keyword_filter.strip() if keyword_case_sensitive else keyword_filter.strip().lower()
+            filtered_entries = [
+                (vid, title) for vid, title in entries
+                if needle in (title if keyword_case_sensitive else title.lower())
+            ]
+
+            if not filtered_entries:
+                st.error(f"No videos found with '{keyword_filter}' in the title.")
+                return
+
+            total_videos = len(filtered_entries)
+            st.write(f"Found **{total_videos}** video(s) matching **'{keyword_filter}'**. Starting download...")
+            progress_bar = st.progress(0.0)
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                subtitle_files = []
+                for i, (video_id, video_title) in enumerate(filtered_entries):
+                    video_url_item = f"https://www.youtube.com/watch?v={video_id}"
+                    try:
+                        try:
+                            sub_text, lang_code, is_auto = get_transcript_api(video_id, format_choice, sub_mode)
+                            fallback_used = False
+                        except Exception:
+                            sub_text, lang_code, is_auto = get_subtitles_yt_dlp(
+                                video_url_item, format_choice, cookies_file, temp_dir, sub_mode)
+                            fallback_used = True
+
+                        if clean_transcript:
+                            sub_text = clean_subtitle_text(sub_text)
+                        if format_choice == 'txt':
+                            sub_text = convert_srt_to_txt(sub_text)
+
+                        subtitle_files.append((video_title, sub_text))
+                        lang_name = format_language_option(lang_code)
+                        auto_note = ' (Auto-generated)' if is_auto else ''
+                        source_note = ' (via yt-dlp)' if fallback_used else ''
+                        st.info(f"✓ '{video_title}' — {lang_name}{auto_note}{source_note}")
+                    except ValueError as ve:
+                        msg = str(ve).lower()
+                        if "age-restricted" in msg or "access denied" in msg:
+                            st.warning(f"⚠️ '{video_title}' is age-restricted. Upload cookies to access.")
+                        else:
+                            st.warning(f"⚠️ No subs for '{video_title}': {str(ve)}")
+                    except Exception as e:
+                        st.warning(f"⚠️ Error for '{video_title}': {str(e)}")
+
+                    progress_bar.progress((i + 1) / total_videos)
+
+                if not subtitle_files:
+                    st.error("Nothing was downloaded.")
+                    return
+
+                st.success(f"Done! Got subtitles for {len(subtitle_files)}/{total_videos} matching video(s).")
+                mime_type = get_mime_type(format_choice)
+                safe_name = f"{channel_title}_{keyword_filter}"
+
+                if keyword_combine_choice == "combined":
+                    combined = combine_subtitles(subtitle_files, temp_dir, safe_name, format_choice)
+                    with open(combined, "rb") as f:
+                        st.download_button("📄 Download Combined File", f.read(),
+                                           os.path.basename(combined), mime_type)
+                else:
+                    zip_buffer, zip_name = create_zip(subtitle_files, safe_name, format_choice)
+                    st.download_button("📦 Download ZIP", zip_buffer, zip_name, "application/zip")
+
+            if cookies_file and os.path.exists(cookies_file):
+                os.unlink(cookies_file)
+            return
+
         # ── Multi-Video mode ──────────────────────────────────────────────────
         if mode == "single / Multi-Video":
             raw_urls = [u.strip() for u in st.session_state.get("multi_urls", []) if u.strip()]
@@ -607,11 +766,11 @@ def main():
 
                     try:
                         try:
-                            sub_text, lang_code, is_auto = get_transcript_api(video_id, format_choice, target_lang)
+                            sub_text, lang_code, is_auto = get_transcript_api(video_id, format_choice, sub_mode)
                             fallback_used = False
                         except Exception:
                             sub_text, lang_code, is_auto = get_subtitles_yt_dlp(
-                                video_url_item, format_choice, cookies_file, temp_dir, target_lang)
+                                video_url_item, format_choice, cookies_file, temp_dir, sub_mode)
                             fallback_used = True
 
                         if clean_transcript:
@@ -752,11 +911,11 @@ def main():
                     video_url_item = f"https://www.youtube.com/watch?v={video_id}"
                     try:
                         try:
-                            sub_text, lang_code, is_auto = get_transcript_api(video_id, format_choice, target_lang)
+                            sub_text, lang_code, is_auto = get_transcript_api(video_id, format_choice, sub_mode)
                             fallback_used = False
                         except Exception:
                             sub_text, lang_code, is_auto = get_subtitles_yt_dlp(
-                                video_url_item, format_choice, cookies_file, temp_dir, target_lang)
+                                video_url_item, format_choice, cookies_file, temp_dir, sub_mode)
                             fallback_used = True
 
                         if clean_transcript:

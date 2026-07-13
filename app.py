@@ -152,11 +152,16 @@ def get_transcript_api(video_id, format_choice='srt', mode='original'):
                 transcript = transcript_list.find_transcript(['en'])
                 is_auto = transcript.is_generated
             except NoTranscriptFound:
-                base_transcript = _pick_original_transcript(transcript_list)
-                if not base_transcript.is_translatable:
+                candidates = list(transcript_list)
+                translatable = [t for t in candidates if t.is_translatable]
+                if not translatable:
                     raise ValueError(
-                        "No English transcript exists and this track can't be machine-translated."
+                        "No English transcript exists and none of the available tracks can be machine-translated."
                     )
+                # Auto-generated tracks are almost always translatable; manually-uploaded
+                # ones often aren't, so prefer a translatable auto-generated track first.
+                generated_translatable = [t for t in translatable if t.is_generated]
+                base_transcript = generated_translatable[0] if generated_translatable else translatable[0]
                 transcript = base_transcript.translate('en')
                 is_auto = True
             lang_code = 'en'
@@ -199,13 +204,16 @@ def get_subtitles_yt_dlp(video_url, format_choice, cookies_file, temp_dir, mode=
 
     if mode == 'en_translation':
         # YouTube exposes machine-translated caption tracks (any spoken language -> English)
-        # through automatic_captions, keyed by the target language code.
+        # through automatic_captions, keyed by the target language code. Translated tracks
+        # aren't always offered in srt, so ask for a format preference list instead of
+        # forcing dl_format, and then accept whichever subtitle extension actually landed.
         ydl_opts = {**base_opts, 'subtitleslangs': ['en'], 'automaticsubslangs': ['en'],
-                    'subtitlesformat': dl_format}
+                    'subtitlesformat': f'{dl_format}/vtt/srv3/srv1/best'}
         with YoutubeDL(ydl_opts) as ydl:
             ydl.download([video_url])
-        files = (glob.glob(os.path.join(temp_dir, f'*.en.{dl_format}')) +
-                 glob.glob(os.path.join(temp_dir, '*.en.vtt')))
+        files = []
+        for ext in [dl_format, 'vtt', 'ttml', 'srv3', 'srv2', 'srv1', 'json3']:
+            files += glob.glob(os.path.join(temp_dir, f'*.en.{ext}'))
         target_code = 'en'
     else:
         # 'original': figure out which language the video's captions are actually in first
@@ -521,7 +529,15 @@ def main():
             keyword_channel_url = st.text_input(
                 "Channel URL", placeholder="https://www.youtube.com/@channelname"
             )
-            keyword_filter = st.text_input("Keyword", placeholder="e.g. Interview")
+            keyword_filter = st.text_input(
+                "Keyword(s)", placeholder="e.g. interview-lecture-part1"
+            )
+            st.caption(
+                "Enter one keyword, or several separated by a dash (-), e.g. "
+                "'interview-lecture'. A video is included if its title contains "
+                "ANY of the keywords. If one keyword matches nothing, it's just "
+                "skipped with a note — it won't stop the others from downloading."
+            )
             keyword_case_sensitive = st.checkbox("Case-sensitive match", value=False)
             keyword_combine_choice = st.selectbox("Output", ["separate", "combined"], key="keyword_combine")
             st.markdown("---")
@@ -652,18 +668,34 @@ def main():
                 st.error("No videos found on this channel.")
                 return
 
-            needle = keyword_filter.strip() if keyword_case_sensitive else keyword_filter.strip().lower()
-            filtered_entries = [
-                (vid, title) for vid, title in entries
-                if needle in (title if keyword_case_sensitive else title.lower())
-            ]
+            raw_keywords = [k.strip() for k in keyword_filter.split('-') if k.strip()]
+            if not raw_keywords:
+                st.error("Please enter at least one keyword.")
+                return
+
+            seen_ids = set()
+            filtered_entries = []
+            for kw in raw_keywords:
+                needle = kw if keyword_case_sensitive else kw.lower()
+                matches = [
+                    (vid, title) for vid, title in entries
+                    if needle in (title if keyword_case_sensitive else title.lower())
+                ]
+                if not matches:
+                    st.warning(f"⚠️ Keyword '{kw}' was not found in any video title on this channel.")
+                    continue
+                for vid, title in matches:
+                    if vid not in seen_ids:
+                        seen_ids.add(vid)
+                        filtered_entries.append((vid, title))
 
             if not filtered_entries:
-                st.error(f"No videos found with '{keyword_filter}' in the title.")
+                st.error(f"None of the keyword(s) matched any videos on this channel.")
                 return
 
             total_videos = len(filtered_entries)
-            st.write(f"Found **{total_videos}** video(s) matching **'{keyword_filter}'**. Starting download...")
+            kw_display = "' / '".join(raw_keywords)
+            st.write(f"Found **{total_videos}** video(s) matching **'{kw_display}'**. Starting download...")
             progress_bar = st.progress(0.0)
 
             with tempfile.TemporaryDirectory() as temp_dir:

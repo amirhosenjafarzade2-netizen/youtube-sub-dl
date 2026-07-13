@@ -3,10 +3,7 @@ import os
 import zipfile
 import re
 import glob
-import time
-from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
-import urllib.request
-import urllib.error
+from urllib.parse import urlparse, parse_qs
 from yt_dlp import YoutubeDL
 from yt_dlp.utils import sanitize_filename
 import tempfile
@@ -144,30 +141,19 @@ def _pick_original_transcript(transcript_list):
 def get_transcript_api(video_id, format_choice='srt', mode='original'):
     """
     mode:
-      'original'       -> fetch the transcript in the video's native/original language
-      'en_translation' -> fetch an English transcript, translating on the fly if needed
+      'original'  -> fetch the transcript in the video's native/original language
+      'en_manual' -> fetch ONLY a manually-uploaded (non-auto-generated) English transcript
     """
     try:
         transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
 
-        if mode == 'en_translation':
-            try:
-                transcript = transcript_list.find_transcript(['en'])
-                is_auto = transcript.is_generated
-            except NoTranscriptFound:
-                candidates = list(transcript_list)
-                translatable = [t for t in candidates if t.is_translatable]
-                if not translatable:
-                    raise ValueError(
-                        "No English transcript exists and none of the available tracks can be machine-translated."
-                    )
-                # Auto-generated tracks are almost always translatable; manually-uploaded
-                # ones often aren't, so prefer a translatable auto-generated track first.
-                generated_translatable = [t for t in translatable if t.is_generated]
-                base_transcript = generated_translatable[0] if generated_translatable else translatable[0]
-                transcript = base_transcript.translate('en')
-                is_auto = True
+        if mode == 'en_manual':
+            manual_en = [t for t in transcript_list if t.language_code == 'en' and not t.is_generated]
+            if not manual_en:
+                raise ValueError("This video has no English subtitles.")
+            transcript = manual_en[0]
             lang_code = 'en'
+            is_auto = False
         else:  # 'original'
             transcript = _pick_original_transcript(transcript_list)
             lang_code = transcript.language_code
@@ -187,6 +173,8 @@ def get_transcript_api(video_id, format_choice='srt', mode='original'):
 
     except CouldNotRetrieveTranscript as e:
         raise ValueError(f"Access denied (age-restricted?): {str(e)}")
+    except ValueError:
+        raise
     except Exception as e:
         raise ValueError(f"API error: {str(e)}")
 
@@ -216,57 +204,9 @@ def vtt_to_srt(vtt_text):
             counter += 1
     return '\n'.join(srt_blocks) + '\n'
 
-_LAST_TRANSLATE_REQUEST_TIME = [0.0]
-_TRANSLATE_MIN_INTERVAL = 1.5  # seconds enforced between consecutive translate requests,
-                                # process-wide, regardless of which loop is calling this
-
-def _pace_translate_requests():
-    elapsed = time.monotonic() - _LAST_TRANSLATE_REQUEST_TIME[0]
-    if elapsed < _TRANSLATE_MIN_INTERVAL:
-        time.sleep(_TRANSLATE_MIN_INTERVAL - elapsed)
-    _LAST_TRANSLATE_REQUEST_TIME[0] = time.monotonic()
-
-def _fetch_translated_caption_text(base_url, tlang='en', max_retries=5):
-    """Manually request YouTube's on-the-fly caption translation (tlang param) for a
-    given caption track URL, bypassing yt-dlp's own list of pre-known languages.
-    Paces requests and retries with backoff on HTTP 429 (rate limiting)."""
-    parsed = urlparse(base_url)
-    qs = parse_qs(parsed.query)
-    qs['tlang'] = [tlang]
-    qs['fmt'] = ['vtt']
-    new_query = urlencode(qs, doseq=True)
-    new_url = urlunparse(parsed._replace(query=new_query))
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    }
-
-    for attempt in range(max_retries):
-        _pace_translate_requests()
-        req = urllib.request.Request(new_url, headers=headers)
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                raw = resp.read().decode('utf-8', errors='replace')
-            if not raw.strip():
-                raise ValueError("YouTube returned an empty translated caption track.")
-            return raw
-        except urllib.error.HTTPError as e:
-            if e.code == 429:
-                if attempt < max_retries - 1:
-                    backoff = min(2 ** attempt * 3, 45)
-                    time.sleep(backoff)
-                    continue
-                raise ValueError(
-                    "YouTube rate-limited the translation requests (HTTP 429) after several "
-                    "retries. Try again in a few minutes, or download fewer videos at once."
-                )
-            raise ValueError(f"HTTP {e.code} fetching translated captions: {e.reason}")
-    raise ValueError("Failed to fetch translated captions after multiple retries.")
-
 def get_subtitles_yt_dlp(video_url, format_choice, cookies_file, temp_dir, mode='original'):
     dl_format = 'srt' if format_choice == 'txt' else format_choice
     base_opts = {
-        'writesubtitles': True,
-        'writeautomaticsub': True,
         'skip_download': True,
         'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
         'quiet': True,
@@ -283,9 +223,12 @@ def get_subtitles_yt_dlp(video_url, format_choice, cookies_file, temp_dir, mode=
     manual = info.get('subtitles') or {}
     auto = info.get('automatic_captions') or {}
 
-    def _download_lang(lang_code):
-        _pace_translate_requests()
-        ydl_opts = {**base_opts, 'subtitleslangs': [lang_code], 'automaticsubslangs': [lang_code],
+    def _download(lang_code, allow_auto):
+        ydl_opts = {**base_opts,
+                    'writesubtitles': True,
+                    'writeautomaticsub': allow_auto,
+                    'subtitleslangs': [lang_code],
+                    'automaticsubslangs': [lang_code] if allow_auto else [],
                     'subtitlesformat': f'{dl_format}/vtt/srv3/srv1/best'}
         with YoutubeDL(ydl_opts) as ydl:
             ydl.download([video_url])
@@ -294,37 +237,20 @@ def get_subtitles_yt_dlp(video_url, format_choice, cookies_file, temp_dir, mode=
             found += glob.glob(os.path.join(temp_dir, f'*.{lang_code}.{ext}'))
         return found
 
-    if mode == 'en_translation':
-        # 1) If yt-dlp already lists a ready-made 'en' track (native or pre-listed
-        #    translation), just grab it - this is the cheap, reliable path.
-        if 'en' in manual or 'en' in auto:
-            files = _download_lang('en')
-            if files:
-                sub_path = files[0]
-                with open(sub_path, 'r', encoding='utf-8') as f:
-                    sub_text = f.read()
-                os.remove(sub_path)
-                if sub_path.endswith('.vtt') and format_choice != 'txt' and format_choice == 'srt':
-                    sub_text = vtt_to_srt(sub_text)
-                is_auto = 'en' not in manual
-                return sub_text, 'en', is_auto
-
-        # 2) yt-dlp didn't surface an 'en' key - fall back to manually requesting
-        #    YouTube's translate-on-demand (tlang=en) on whatever auto-caption track
-        #    does exist. This is what actually gets you the "auto-translate to English"
-        #    option you see in the YouTube web player, even when yt-dlp doesn't list it.
-        if auto:
-            base_lang = next(iter(auto.keys()))
-            track_list = auto[base_lang]
-            base_track_url = next((t.get('url') for t in track_list if t.get('ext') == 'vtt'), None)
-            if not base_track_url and track_list:
-                base_track_url = track_list[0].get('url')
-            if base_track_url:
-                vtt_text = _fetch_translated_caption_text(base_track_url, tlang='en')
-                sub_text = vtt_to_srt(vtt_text) if format_choice == 'srt' else vtt_text
-                return sub_text, 'en', True
-
-        raise ValueError("No English transcript or translatable auto-caption track found for this video.")
+    if mode == 'en_manual':
+        # Only ever accept a real, uploader-provided English track - never auto-generated.
+        if 'en' not in manual:
+            raise ValueError("This video has no English subtitles.")
+        files = _download('en', allow_auto=False)
+        if not files:
+            raise ValueError("This video has no English subtitles.")
+        sub_path = files[0]
+        with open(sub_path, 'r', encoding='utf-8') as f:
+            sub_text = f.read()
+        os.remove(sub_path)
+        if sub_path.endswith('.vtt') and format_choice == 'srt':
+            sub_text = vtt_to_srt(sub_text)
+        return sub_text, 'en', False
 
     else:  # 'original'
         native_lang = info.get('language')
@@ -339,7 +265,7 @@ def get_subtitles_yt_dlp(video_url, format_choice, cookies_file, temp_dir, mode=
         if not lang_code:
             raise ValueError("No subtitles found")
 
-        files = _download_lang(lang_code)
+        files = _download(lang_code, allow_auto=True)
         if not files:
             raise ValueError("No subtitles found")
 

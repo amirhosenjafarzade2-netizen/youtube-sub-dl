@@ -384,6 +384,28 @@ def get_info(url, is_playlist=False, cookies_file=None):
             title = info.get('title', 'video_subtitles')
         return [(video_id, title)], title
 
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+def get_search_info(query, max_results, cookies_file=None):
+    """Search YouTube for `query` and return the top `max_results` videos as
+    a list of (video_id, title) tuples, using yt-dlp's ytsearch extractor."""
+    max_results = max(1, min(int(max_results), 500))
+    search_target = f"ytsearch{max_results}:{query}"
+    ydl_opts = {
+        'extract_flat': True,
+        'quiet': True,
+        'no_warnings': True,
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'cookiefile': cookies_file,
+    }
+    with YoutubeDL(ydl_opts) as ydl:
+        result = ydl.extract_info(search_target, download=False)
+        entries = result.get('entries', []) if result else []
+        video_ids = [e.get('id') for e in entries if e and e.get('id')]
+        titles = [e.get('title', f'video_{i+1}') for i, e in enumerate(entries) if e and e.get('id')]
+        return list(zip(video_ids, titles))
+
+
 def convert_srt_to_txt(srt_text):
     lines = srt_text.split('\n')
     txt_lines = []
@@ -572,7 +594,7 @@ def main():
         # ── Mode selector ──────────────────────────────────────────────────────
         mode = st.radio(
             "Download Mode",
-            ["Playlist / Channel", "single / Multi-Video", "Channel + Keyword"],
+            ["Playlist / Channel", "single / Multi-Video", "Channel + Keyword", "Keyword Search"],
             key="download_mode",
             horizontal=True,
         )
@@ -584,6 +606,9 @@ def main():
         keyword_case_sensitive = False
         keyword_combine_choice = "separate"
         multi_combine_choice = "separate"
+        search_query = None
+        search_max_results = 10
+        search_combine_choice = "separate"
 
         # ── Multi-Video URL inputs ─────────────────────────────────────────────
         if mode == "single / Multi-Video":
@@ -642,6 +667,23 @@ def main():
             keyword_combine_choice = st.selectbox("Output", ["separate", "combined"], key="keyword_combine")
             st.markdown("---")
 
+        elif mode == "Keyword Search":
+            st.markdown("---")
+            st.subheader("🔍 YouTube Keyword Search")
+            st.caption(
+                "Search all of YouTube for a keyword/phrase and download subtitles "
+                "for the top N results — no channel needed."
+            )
+            search_query = st.text_input(
+                "Search keyword(s)", placeholder="e.g. python tutorial for beginners"
+            )
+            search_max_results = st.number_input(
+                "Number of videos (N)", min_value=1, max_value=500, value=10, step=1,
+                help="Top N YouTube search results to fetch subtitles for. Maximum 500."
+            )
+            search_combine_choice = st.selectbox("Output", ["separate", "combined"], key="search_combine")
+            st.markdown("---")
+
         else:
             url = st.text_input("YouTube URL", placeholder="Paste video, playlist, or channel URL...")
 
@@ -667,10 +709,11 @@ def main():
         )
         sub_mode = {'Original Language': 'original', 'English Translation': 'en_translation'}[lang_mode_display]
 
+        video_download_disabled_modes = ("Channel + Keyword", "Keyword Search")
         download_videos = st.checkbox(
             "Download Videos Too", value=False,
-            disabled=(mode == "Channel + Keyword"),
-            help="Not available in Channel + Keyword mode." if mode == "Channel + Keyword" else None,
+            disabled=(mode in video_download_disabled_modes),
+            help="Not available in Channel + Keyword or Keyword Search modes." if mode in video_download_disabled_modes else None,
         )
         quality_options = {
             "Best Quality": "best",
@@ -738,6 +781,87 @@ def main():
     # =========================================================================
     button_text = "⬇️ Download Videos & Subtitles" if download_videos else "⬇️ Download Subtitles"
     if st.button(button_text, type="primary"):
+
+        # ── Keyword Search mode ─────────────────────────────────────────────────
+        if mode == "Keyword Search":
+            if not search_query or not search_query.strip():
+                st.error("Please enter a search keyword.")
+                return
+
+            n_results = int(search_max_results)
+            if n_results < 1 or n_results > 500:
+                st.error("Number of videos (N) must be between 1 and 500.")
+                return
+
+            with st.spinner(f"Searching YouTube for '{search_query}'..."):
+                try:
+                    entries = get_search_info(search_query.strip(), n_results, cookies_file)
+                except Exception as e:
+                    st.error(f"Search failed: {str(e)}")
+                    return
+
+            if not entries:
+                st.error("No videos found for that search.")
+                return
+
+            total_videos = len(entries)
+            st.write(f"Found **{total_videos}** video(s) for **'{search_query}'**. Starting download...")
+            progress_bar = st.progress(0.0)
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                subtitle_files = []
+                for i, (video_id, video_title) in enumerate(entries):
+                    video_url_item = f"https://www.youtube.com/watch?v={video_id}"
+                    try:
+                        try:
+                            sub_text, lang_code, is_auto = get_transcript_api(video_id, format_choice, sub_mode)
+                            fallback_used = False
+                        except Exception:
+                            sub_text, lang_code, is_auto = get_subtitles_yt_dlp(
+                                video_url_item, format_choice, cookies_file, temp_dir, sub_mode)
+                            fallback_used = True
+
+                        if clean_transcript:
+                            sub_text = clean_subtitle_text(sub_text)
+                        if format_choice == 'txt':
+                            sub_text = convert_srt_to_txt(sub_text)
+
+                        subtitle_files.append((video_title, sub_text))
+                        lang_name = format_language_option(lang_code)
+                        auto_note = ' (Auto-generated)' if is_auto else ''
+                        source_note = ' (via yt-dlp)' if fallback_used else ''
+                        st.info(f"✓ '{video_title}' — {lang_name}{auto_note}{source_note}")
+                    except ValueError as ve:
+                        msg = str(ve).lower()
+                        if "age-restricted" in msg or "access denied" in msg:
+                            st.warning(f"⚠️ '{video_title}' is age-restricted. Upload cookies to access.")
+                        else:
+                            st.warning(f"⚠️ No subs for '{video_title}': {str(ve)}")
+                    except Exception as e:
+                        st.warning(f"⚠️ Error for '{video_title}': {str(e)}")
+
+                    progress_bar.progress((i + 1) / total_videos)
+
+                if not subtitle_files:
+                    st.error("Nothing was downloaded.")
+                    return
+
+                st.success(f"Done! Got subtitles for {len(subtitle_files)}/{total_videos} video(s).")
+                mime_type = get_mime_type(format_choice)
+                safe_name = f"search_{search_query.strip()}"
+
+                if search_combine_choice == "combined":
+                    combined = combine_subtitles(subtitle_files, temp_dir, safe_name, format_choice)
+                    with open(combined, "rb") as f:
+                        st.download_button("📄 Download Combined File", f.read(),
+                                           os.path.basename(combined), mime_type)
+                else:
+                    zip_buffer, zip_name = create_zip(subtitle_files, safe_name, format_choice)
+                    st.download_button("📦 Download ZIP", zip_buffer, zip_name, "application/zip")
+
+            if cookies_file and os.path.exists(cookies_file):
+                os.unlink(cookies_file)
+            return
 
         # ── Channel + Keyword mode ──────────────────────────────────────────────
         if mode == "Channel + Keyword":

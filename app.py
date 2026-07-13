@@ -385,12 +385,30 @@ def get_info(url, is_playlist=False, cookies_file=None):
         return [(video_id, title)], title
 
 
+# sp= values are YouTube's own search "Sort by" filter parameters (captured
+# from the live results?...&sp=... URL). None means "let ytsearch use YouTube's
+# default relevance ranking" rather than building a filtered results URL.
+_SEARCH_SORT_SP = {
+    'relevance': None,
+    'most_viewed': 'CAMSAhAB',  # Sort by: View count (all-time)
+    'newest': 'CAI=',           # Sort by: Upload date (newest first)
+}
+
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-def get_search_info(query, max_results, cookies_file=None):
+def get_search_info(query, max_results, cookies_file=None, sort_mode='relevance'):
     """Search YouTube for `query` and return the top `max_results` videos as
-    a list of (video_id, title) tuples, using yt-dlp's ytsearch extractor."""
+    a list of (video_id, title) tuples.
+
+    sort_mode:
+      'relevance'   -> YouTube's default relevance ranking (yt-dlp's ytsearchN: prefix)
+      'most_viewed' -> sorted by all-time view count. This is the closest real
+                        equivalent to "trending for this keyword" — YouTube has
+                        no trending feed that can be scoped to a search term.
+      'newest'      -> sorted by upload date, newest first
+    """
     max_results = max(1, min(int(max_results), 500))
-    search_target = f"ytsearch{max_results}:{query}"
+    sp_value = _SEARCH_SORT_SP.get(sort_mode)
+
     ydl_opts = {
         'extract_flat': True,
         'quiet': True,
@@ -398,11 +416,24 @@ def get_search_info(query, max_results, cookies_file=None):
         'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'cookiefile': cookies_file,
     }
+
+    if sp_value is None:
+        # Plain relevance search: yt-dlp's dedicated search extractor paginates
+        # on its own until it has N results.
+        search_target = f"ytsearch{max_results}:{query}"
+    else:
+        # Sorted search: hit a real youtube.com/results URL carrying YouTube's
+        # own 'sp' sort filter, and cap how many entries get pulled from it.
+        params = urlencode({'search_query': query, 'sp': sp_value})
+        search_target = f"https://www.youtube.com/results?{params}"
+        ydl_opts['playlistend'] = max_results
+
     with YoutubeDL(ydl_opts) as ydl:
         result = ydl.extract_info(search_target, download=False)
         entries = result.get('entries', []) if result else []
-        video_ids = [e.get('id') for e in entries if e and e.get('id')]
-        titles = [e.get('title', f'video_{i+1}') for i, e in enumerate(entries) if e and e.get('id')]
+        entries = [e for e in entries if e and e.get('id')][:max_results]
+        video_ids = [e.get('id') for e in entries]
+        titles = [e.get('title', f'video_{i+1}') for i, e in enumerate(entries)]
         return list(zip(video_ids, titles))
 
 
@@ -609,6 +640,7 @@ def main():
         search_query = None
         search_max_results = 10
         search_combine_choice = "separate"
+        search_sort_mode = "relevance"
 
         # ── Multi-Video URL inputs ─────────────────────────────────────────────
         if mode == "single / Multi-Video":
@@ -677,9 +709,26 @@ def main():
             search_query = st.text_input(
                 "Search keyword(s)", placeholder="e.g. python tutorial for beginners"
             )
+            search_sort_display = st.radio(
+                "Sort results by",
+                ["Relevance", "Most Viewed", "Newest First"],
+                horizontal=True,
+                help=(
+                    "Relevance: YouTube's default ranking for the search term.\n\n"
+                    "Most Viewed: sorted by all-time view count — the closest real "
+                    "equivalent to a keyword-scoped 'trending' list, since YouTube "
+                    "doesn't offer a trending feed limited to a search term.\n\n"
+                    "Newest First: sorted by upload date."
+                ),
+            )
+            search_sort_mode = {
+                "Relevance": "relevance",
+                "Most Viewed": "most_viewed",
+                "Newest First": "newest",
+            }[search_sort_display]
             search_max_results = st.number_input(
                 "Number of videos (N)", min_value=1, max_value=500, value=10, step=1,
-                help="Top N YouTube search results to fetch subtitles for. Maximum 500."
+                help="Top N YouTube search results (in the chosen sort order) to fetch subtitles for. Maximum 500."
             )
             search_combine_choice = st.selectbox("Output", ["separate", "combined"], key="search_combine")
             st.markdown("---")
@@ -795,7 +844,7 @@ def main():
 
             with st.spinner(f"Searching YouTube for '{search_query}'..."):
                 try:
-                    entries = get_search_info(search_query.strip(), n_results, cookies_file)
+                    entries = get_search_info(search_query.strip(), n_results, cookies_file, search_sort_mode)
                 except Exception as e:
                     st.error(f"Search failed: {str(e)}")
                     return
@@ -805,7 +854,8 @@ def main():
                 return
 
             total_videos = len(entries)
-            st.write(f"Found **{total_videos}** video(s) for **'{search_query}'**. Starting download...")
+            sort_label = {"relevance": "relevance", "most_viewed": "most viewed", "newest": "newest"}[search_sort_mode]
+            st.write(f"Found **{total_videos}** video(s) for **'{search_query}'** (sorted by {sort_label}). Starting download...")
             progress_bar = st.progress(0.0)
 
             with tempfile.TemporaryDirectory() as temp_dir:

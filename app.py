@@ -615,187 +615,56 @@ def prepend_video_header(sub_text, video_title, channel_name):
 
 def main():
     st.set_page_config(page_title="YouTube Subtitle Downloader", page_icon="🎥", layout="wide")
-    st.title("YouTube Subtitle Downloader 🎥")
-    st.markdown("Download subtitles from YouTube videos, playlists, and channels!")
 
-    # --- Sidebar ---
-    with st.sidebar:
-        st.header("Settings")
+    st.title("🎥 YouTube Subtitle Downloader")
+    st.caption("Download subtitles from YouTube videos, playlists, and channels — with optional video downloads.")
 
-        # ── Mode selector ──────────────────────────────────────────────────────
-        mode = st.radio(
-            "Download Mode",
-            ["Playlist / Channel", "single / Multi-Video", "Channel + Keyword", "Keyword Search"],
-            key="download_mode",
-            horizontal=True,
+    # =========================================================================
+    # Mode selection — top-level tabs instead of a sidebar radio
+    # =========================================================================
+    tab_playlist, tab_multi, tab_keyword_channel, tab_search = st.tabs(
+        ["📺  Playlist / Channel", "🎬  Single / Multi-Video", "🔎  Channel + Keyword", "🔍  Keyword Search"]
+    )
+
+    # Defaults so these names always exist regardless of chosen mode
+    url = None
+    keyword_channel_url = None
+    keyword_filter = None
+    keyword_case_sensitive = False
+    keyword_combine_choice = "separate"
+    multi_combine_choice = "separate"
+    search_query = None
+    search_max_results = 10
+    search_combine_choice = "separate"
+    search_sort_mode = "relevance"
+    combine_choice = "separate"
+    download_scope = "Entire Playlist"
+    url_type = None
+    playlist_url = None
+    video_url_parsed = None
+    channel_video_scope = "All Videos"
+    channel_range_start = 1
+    channel_range_end = 50
+
+    # ── Tab 1: Playlist / Channel ───────────────────────────────────────────
+    with tab_playlist:
+        url = st.text_input(
+            "YouTube URL", placeholder="Paste video, playlist, or channel URL...",
+            key="playlist_channel_url",
         )
 
-        # Defaults so these names always exist regardless of chosen mode
-        url = None
-        keyword_channel_url = None
-        keyword_filter = None
-        keyword_case_sensitive = False
-        keyword_combine_choice = "separate"
-        multi_combine_choice = "separate"
-        search_query = None
-        search_max_results = 10
-        search_combine_choice = "separate"
-        search_sort_mode = "relevance"
-
-        # ── Multi-Video URL inputs ─────────────────────────────────────────────
-        if mode == "single / Multi-Video":
-            st.markdown("---")
-            st.subheader("🎬 Video URLs")
-            st.caption("Add one video URL per field. Click **＋ Add video** to add more.")
-
-            # Initialise session state list
-            if "multi_urls" not in st.session_state:
-                st.session_state.multi_urls = [""]
-
-            # Render one text_input per entry
-            for idx in range(len(st.session_state.multi_urls)):
-                col_inp, col_del = st.columns([9, 1])
-                with col_inp:
-                    st.session_state.multi_urls[idx] = st.text_input(
-                        f"Video {idx + 1}",
-                        value=st.session_state.multi_urls[idx],
-                        placeholder="https://www.youtube.com/watch?v=...",
-                        key=f"multi_url_{idx}",
-                        label_visibility="collapsed",
-                    )
-                with col_del:
-                    if len(st.session_state.multi_urls) > 1:
-                        if st.button("✕", key=f"del_{idx}", help="Remove this URL"):
-                            st.session_state.multi_urls.pop(idx)
-                            st.rerun()
-
-            col_add, _ = st.columns([1, 3])
-            with col_add:
-                if st.button("＋ Add video"):
-                    st.session_state.multi_urls.append("")
-                    st.rerun()
-
-            multi_combine_choice = st.selectbox("Output", ["separate", "combined"], key="multi_combine")
-
-            st.markdown("---")
-
-        elif mode == "Channel + Keyword":
-            st.markdown("---")
-            st.subheader("🔎 Channel + Keyword Filter")
-            st.caption("Only videos whose title contains the keyword will have their subtitles downloaded.")
-            keyword_channel_url = st.text_input(
-                "Channel URL", placeholder="https://www.youtube.com/@channelname"
-            )
-            keyword_filter = st.text_input(
-                "Keyword(s)", placeholder="e.g. interview-lecture-part1"
-            )
-            st.caption(
-                "Enter one keyword, or several separated by a dash (-), e.g. "
-                "'interview-lecture'. A video is included if its title contains "
-                "ANY of the keywords. If one keyword matches nothing, it's just "
-                "skipped with a note — it won't stop the others from downloading."
-            )
-            keyword_case_sensitive = st.checkbox("Case-sensitive match", value=False)
-            keyword_combine_choice = st.selectbox("Output", ["separate", "combined"], key="keyword_combine")
-            st.markdown("---")
-
-        elif mode == "Keyword Search":
-            st.markdown("---")
-            st.subheader("🔍 YouTube Keyword Search")
-            st.caption(
-                "Search all of YouTube for a keyword/phrase and download subtitles "
-                "for the top N results — no channel needed."
-            )
-            search_query = st.text_input(
-                "Search keyword(s)", placeholder="e.g. python tutorial for beginners"
-            )
-            search_sort_display = st.radio(
-                "Sort results by",
-                ["Relevance", "Most Viewed", "Newest First"],
-                horizontal=True,
-                help=(
-                    "Relevance: YouTube's default ranking for the search term.\n\n"
-                    "Most Viewed: sorted by all-time view count — the closest real "
-                    "equivalent to a keyword-scoped 'trending' list, since YouTube "
-                    "doesn't offer a trending feed limited to a search term.\n\n"
-                    "Newest First: sorted by upload date."
-                ),
-            )
-            search_sort_mode = {
-                "Relevance": "relevance",
-                "Most Viewed": "most_viewed",
-                "Newest First": "newest",
-            }[search_sort_display]
-            search_max_results = st.number_input(
-                "Number of videos (N)", min_value=1, max_value=500, value=10, step=1,
-                help="Top N YouTube search results (in the chosen sort order) to fetch subtitles for. Maximum 500."
-            )
-            search_combine_choice = st.selectbox("Output", ["separate", "combined"], key="search_combine")
-            st.markdown("---")
-
-        else:
-            url = st.text_input("YouTube URL", placeholder="Paste video, playlist, or channel URL...")
-
-        # ── Shared settings ────────────────────────────────────────────────────
-        st.markdown("""
-**For Age-Restricted Videos**: Upload cookies to bypass blocks.
-1. Use the "Get cookies.txt LOCALLY" browser extension.
-2. Log in to YouTube, visit the video.
-3. Export as `cookies.txt` and upload below.
-        """)
-        uploaded_file = st.file_uploader("Upload Cookies (Optional)", type=["txt"])
-        cookies_file = None
-        if uploaded_file:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as tmp:
-                tmp.write(uploaded_file.read())
-                cookies_file = tmp.name
-
-        format_choice = st.selectbox("Subtitle Format", ["srt", "vtt", "txt"])
-        clean_transcript = st.checkbox("Clean Transcript", value=True)
-
-        lang_mode_display = st.radio(
-            "Subtitle Language", ['Original Language', 'English Translation'], horizontal=True
-        )
-        sub_mode = {'Original Language': 'original', 'English Translation': 'en_translation'}[lang_mode_display]
-
-        video_download_disabled_modes = ("Channel + Keyword", "Keyword Search")
-        download_videos = st.checkbox(
-            "Download Videos Too", value=False,
-            disabled=(mode in video_download_disabled_modes),
-            help="Not available in Channel + Keyword or Keyword Search modes." if mode in video_download_disabled_modes else None,
-        )
-        quality_options = {
-            "Best Quality": "best",
-            "720p": "best[height<=720]",
-            "480p": "best[height<=480]",
-            "Audio Only": "bestaudio",
-        }
-        quality = st.selectbox("Video Quality", list(quality_options.keys()), index=0,
-                               disabled=not download_videos)
-        selected_quality = quality_options[quality]
-
-        # Defaults (only used in single/playlist/channel mode)
-        combine_choice = "separate"
-        download_scope = "Entire Playlist"
-        url_type = None
-        playlist_url = None
-        video_url_parsed = None
-        channel_video_scope = "All Videos"
-        channel_range_start = 1
-        channel_range_end = 50
-
-        if mode == "Playlist / Channel" and url:
+        if url:
             try:
                 playlist_url, video_url_parsed, url_type = validate_url(url)
 
                 if url_type == 'channel':
                     st.info("📺 Channel URL detected — will fetch all uploaded videos.")
-                    st.markdown("---")
-                    st.subheader("📋 Video Selection")
+                    st.markdown("**Video selection**")
                     channel_video_scope = st.radio(
                         "Which videos to download?",
                         ["All Videos", "Range (oldest → newest)"],
-                        key="channel_scope"
+                        key="channel_scope",
+                        horizontal=True,
                     )
                     if channel_video_scope == "Range (oldest → newest)":
                         st.caption(
@@ -813,23 +682,189 @@ def main():
                             )
                         if channel_range_start > channel_range_end:
                             st.warning("⚠️ 'From' must be ≤ 'To'.")
-                    st.markdown("---")
 
                 if url_type == 'both':
-                    download_scope = st.selectbox("Scope", ["Entire Playlist", "Single Video"], key="scope")
+                    download_scope = st.radio(
+                        "Scope", ["Entire Playlist", "Single Video"], key="scope", horizontal=True
+                    )
 
                 is_playlist_mode = url_type in ['playlist', 'channel'] or (
                     url_type == 'both' and download_scope == "Entire Playlist")
                 if is_playlist_mode:
-                    combine_choice = st.selectbox("Output", ["separate", "combined"], key="combine")
+                    combine_choice = st.radio(
+                        "Output", ["separate", "combined"], key="combine", horizontal=True
+                    )
             except ValueError as ve:
                 st.error(str(ve))
+
+    # ── Tab 2: Single / Multi-Video ─────────────────────────────────────────
+    with tab_multi:
+        st.caption("Add one video URL per field. Click **＋ Add video** to add more.")
+
+        if "multi_urls" not in st.session_state:
+            st.session_state.multi_urls = [""]
+
+        for idx in range(len(st.session_state.multi_urls)):
+            col_inp, col_del = st.columns([9, 1])
+            with col_inp:
+                st.session_state.multi_urls[idx] = st.text_input(
+                    f"Video {idx + 1}",
+                    value=st.session_state.multi_urls[idx],
+                    placeholder="https://www.youtube.com/watch?v=...",
+                    key=f"multi_url_{idx}",
+                    label_visibility="collapsed",
+                )
+            with col_del:
+                if len(st.session_state.multi_urls) > 1:
+                    if st.button("✕", key=f"del_{idx}", help="Remove this URL"):
+                        st.session_state.multi_urls.pop(idx)
+                        st.rerun()
+
+        col_add, _ = st.columns([1, 3])
+        with col_add:
+            if st.button("＋ Add video"):
+                st.session_state.multi_urls.append("")
+                st.rerun()
+
+        multi_combine_choice = st.radio(
+            "Output", ["separate", "combined"], key="multi_combine", horizontal=True
+        )
+
+    # ── Tab 3: Channel + Keyword ─────────────────────────────────────────────
+    with tab_keyword_channel:
+        st.caption("Only videos whose title contains the keyword will have their subtitles downloaded.")
+        keyword_channel_url = st.text_input(
+            "Channel URL", placeholder="https://www.youtube.com/@channelname", key="kw_channel_url"
+        )
+        keyword_filter = st.text_input(
+            "Keyword(s)", placeholder="e.g. interview-lecture-part1", key="kw_filter"
+        )
+        st.caption(
+            "Enter one keyword, or several separated by a dash (-), e.g. "
+            "'interview-lecture'. A video is included if its title contains "
+            "ANY of the keywords. If one keyword matches nothing, it's just "
+            "skipped with a note — it won't stop the others from downloading."
+        )
+        keyword_case_sensitive = st.checkbox("Case-sensitive match", value=False, key="kw_case")
+        keyword_combine_choice = st.radio(
+            "Output", ["separate", "combined"], key="keyword_combine", horizontal=True
+        )
+
+    # ── Tab 4: Keyword Search ───────────────────────────────────────────────
+    with tab_search:
+        st.caption(
+            "Search all of YouTube for a keyword/phrase and download subtitles "
+            "for the top N results — no channel needed."
+        )
+        search_query = st.text_input(
+            "Search keyword(s)", placeholder="e.g. python tutorial for beginners", key="search_query"
+        )
+        search_sort_display = st.radio(
+            "Sort results by",
+            ["Relevance", "Most Viewed", "Newest First"],
+            horizontal=True,
+            key="search_sort",
+            help=(
+                "Relevance: YouTube's default ranking for the search term.\n\n"
+                "Most Viewed: sorted by all-time view count — the closest real "
+                "equivalent to a keyword-scoped 'trending' list, since YouTube "
+                "doesn't offer a trending feed limited to a search term.\n\n"
+                "Newest First: sorted by upload date."
+            ),
+        )
+        search_sort_mode = {
+            "Relevance": "relevance",
+            "Most Viewed": "most_viewed",
+            "Newest First": "newest",
+        }[search_sort_display]
+        col_n, _ = st.columns([1, 2])
+        with col_n:
+            search_max_results = st.number_input(
+                "Number of videos (N)", min_value=1, max_value=500, value=10, step=1,
+                help="Top N YouTube search results (in the chosen sort order) to fetch subtitles for. Maximum 500."
+            )
+        search_combine_choice = st.radio(
+            "Output", ["separate", "combined"], key="search_combine", horizontal=True
+        )
+
+    # Track which tab is "active" using the mode of whichever has usable input,
+    # falling back to a session-state selector so the download button knows
+    # which workflow to run. We use a lightweight radio (visually de-emphasized)
+    # tied to the tabs above, defaulting to whichever tab currently has content.
+    mode_options = ["Playlist / Channel", "single / Multi-Video", "Channel + Keyword", "Keyword Search"]
+    if "download_mode" not in st.session_state:
+        st.session_state.download_mode = mode_options[0]
+
+    st.markdown("---")
+    st.markdown("**Which tab do you want to run?**")
+    mode = st.radio(
+        "Active mode", mode_options, horizontal=True,
+        key="download_mode", label_visibility="collapsed",
+    )
+
+    # =========================================================================
+    # Shared settings — laid out as horizontal radio bars in the main area
+    # =========================================================================
+    with st.expander("⚙️ Shared Settings (format, language, cookies, video quality)", expanded=True):
+        col_a, col_b = st.columns(2)
+
+        with col_a:
+            format_choice = st.radio(
+                "Subtitle Format", ["srt", "vtt", "txt"], horizontal=True, key="format_choice"
+            )
+            clean_transcript = st.checkbox("Clean Transcript", value=True, key="clean_transcript")
+
+        with col_b:
+            lang_mode_display = st.radio(
+                "Subtitle Language", ['Original Language', 'English Translation'],
+                horizontal=True, key="lang_mode"
+            )
+            sub_mode = {'Original Language': 'original', 'English Translation': 'en_translation'}[lang_mode_display]
+
+        st.markdown("---")
+
+        video_download_disabled_modes = ("Channel + Keyword", "Keyword Search")
+        col_c, col_d = st.columns(2)
+        with col_c:
+            download_videos = st.checkbox(
+                "Download Videos Too", value=False,
+                disabled=(mode in video_download_disabled_modes),
+                help="Not available in Channel + Keyword or Keyword Search modes." if mode in video_download_disabled_modes else None,
+                key="download_videos",
+            )
+        quality_options = {
+            "Best Quality": "best",
+            "720p": "best[height<=720]",
+            "480p": "best[height<=480]",
+            "Audio Only": "bestaudio",
+        }
+        with col_d:
+            quality = st.radio(
+                "Video Quality", list(quality_options.keys()), index=0,
+                disabled=not download_videos, horizontal=True, key="quality",
+            )
+        selected_quality = quality_options[quality]
+
+        st.markdown("---")
+        st.markdown(
+            "**For Age-Restricted Videos**: Upload cookies to bypass blocks.\n"
+            "1. Use the \"Get cookies.txt LOCALLY\" browser extension.\n"
+            "2. Log in to YouTube, visit the video.\n"
+            "3. Export as `cookies.txt` and upload below."
+        )
+        uploaded_file = st.file_uploader("Upload Cookies (Optional)", type=["txt"], key="cookies_upload")
+        cookies_file = None
+        if uploaded_file:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as tmp:
+                tmp.write(uploaded_file.read())
+                cookies_file = tmp.name
 
     # =========================================================================
     # Download button
     # =========================================================================
+    st.markdown("---")
     button_text = "⬇️ Download Videos & Subtitles" if download_videos else "⬇️ Download Subtitles"
-    if st.button(button_text, type="primary"):
+    if st.button(button_text, type="primary", use_container_width=True):
 
         # ── Keyword Search mode ─────────────────────────────────────────────────
         if mode == "Keyword Search":

@@ -620,10 +620,14 @@ def main():
     st.caption("Download subtitles from YouTube videos, playlists, and channels — with optional video downloads.")
 
     # =========================================================================
-    # Mode selection — top-level tabs instead of a sidebar radio
+    # Mode selection — single source of truth (no separate tabs + radio)
     # =========================================================================
-    tab_playlist, tab_multi, tab_keyword_channel, tab_search = st.tabs(
-        ["📺  Playlist / Channel", "🎬  Single / Multi-Video", "🔎  Channel + Keyword", "🔍  Keyword Search"]
+    mode_options = ["Playlist / Channel", "Single / Multi-Video", "Channel + Keyword", "Keyword Search"]
+    if "download_mode" not in st.session_state:
+        st.session_state.download_mode = mode_options[0]
+
+    mode = st.radio(
+        "What do you want to download?", mode_options, horizontal=True, key="download_mode",
     )
 
     # Defaults so these names always exist regardless of chosen mode
@@ -646,8 +650,10 @@ def main():
     channel_range_start = 1
     channel_range_end = 50
 
-    # ── Tab 1: Playlist / Channel ───────────────────────────────────────────
-    with tab_playlist:
+    st.markdown("---")
+
+    # ── Playlist / Channel ──────────────────────────────────────────────────
+    if mode == "Playlist / Channel":
         url = st.text_input(
             "YouTube URL", placeholder="Paste video, playlist, or channel URL...",
             key="playlist_channel_url",
@@ -697,8 +703,8 @@ def main():
             except ValueError as ve:
                 st.error(str(ve))
 
-    # ── Tab 2: Single / Multi-Video ─────────────────────────────────────────
-    with tab_multi:
+    # ── Single / Multi-Video ────────────────────────────────────────────────
+    elif mode == "Single / Multi-Video":
         st.caption("Add one video URL per field. Click **＋ Add video** to add more.")
 
         if "multi_urls" not in st.session_state:
@@ -730,8 +736,8 @@ def main():
             "Output", ["separate", "combined"], key="multi_combine", horizontal=True
         )
 
-    # ── Tab 3: Channel + Keyword ─────────────────────────────────────────────
-    with tab_keyword_channel:
+    # ── Channel + Keyword ────────────────────────────────────────────────────
+    elif mode == "Channel + Keyword":
         st.caption("Only videos whose title contains the keyword will have their subtitles downloaded.")
         keyword_channel_url = st.text_input(
             "Channel URL", placeholder="https://www.youtube.com/@channelname", key="kw_channel_url"
@@ -750,8 +756,8 @@ def main():
             "Output", ["separate", "combined"], key="keyword_combine", horizontal=True
         )
 
-    # ── Tab 4: Keyword Search ───────────────────────────────────────────────
-    with tab_search:
+    # ── Keyword Search ──────────────────────────────────────────────────────
+    elif mode == "Keyword Search":
         st.caption(
             "Search all of YouTube for a keyword/phrase and download subtitles "
             "for the top N results — no channel needed."
@@ -786,21 +792,6 @@ def main():
         search_combine_choice = st.radio(
             "Output", ["separate", "combined"], key="search_combine", horizontal=True
         )
-
-    # Track which tab is "active" using the mode of whichever has usable input,
-    # falling back to a session-state selector so the download button knows
-    # which workflow to run. We use a lightweight radio (visually de-emphasized)
-    # tied to the tabs above, defaulting to whichever tab currently has content.
-    mode_options = ["Playlist / Channel", "single / Multi-Video", "Channel + Keyword", "Keyword Search"]
-    if "download_mode" not in st.session_state:
-        st.session_state.download_mode = mode_options[0]
-
-    st.markdown("---")
-    st.markdown("**Which tab do you want to run?**")
-    mode = st.radio(
-        "Active mode", mode_options, horizontal=True,
-        key="download_mode", label_visibility="collapsed",
-    )
 
     # =========================================================================
     # Shared settings — laid out as horizontal radio bars in the main area
@@ -1063,7 +1054,7 @@ def main():
             return
 
         # ── Multi-Video mode ──────────────────────────────────────────────────
-        if mode == "single / Multi-Video":
+        if mode == "Single / Multi-Video":
             raw_urls = [u.strip() for u in st.session_state.get("multi_urls", []) if u.strip()]
             if not raw_urls:
                 st.error("Please enter at least one video URL.")

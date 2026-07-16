@@ -490,53 +490,6 @@ def create_zip(subtitle_files, title, format_choice):
     zip_buffer.seek(0)
     return zip_buffer, f"{safe_title}_subtitles.zip"
 
-def create_video_zip(video_files, subtitle_files, title):
-    """Bundle downloaded video files and subtitle files into one ZIP."""
-    zip_buffer = BytesIO()
-    safe_title = sanitize_filename(title)[:150]
-    sub_map = {sanitize_filename(t)[:150]: text for t, text in subtitle_files}
-    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zipf:
-        for video_path in video_files:
-            if os.path.exists(video_path):
-                zipf.write(video_path, os.path.basename(video_path))
-        for video_title, sub_text in subtitle_files:
-            ext = 'srt'
-            filename = f"{sanitize_filename(video_title)[:150]}.{ext}"
-            zipf.writestr(filename, sub_text.encode('utf-8'))
-    zip_buffer.seek(0)
-    return zip_buffer, f"{safe_title}_videos_and_subs.zip"
-
-def download_videos_yt_dlp(entries, url, quality, cookies_file, temp_dir, progress_bar):
-    """Download video files for all entries using yt-dlp."""
-    video_files = []
-    ydl_opts = {
-        'format': quality,
-        'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
-        'quiet': True,
-        'no_warnings': True,
-        'cookiefile': cookies_file,
-        'restrict_filenames': True,
-        'ignoreerrors': True,
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    }
-    total = len(entries)
-    with YoutubeDL(ydl_opts) as ydl:
-        for i, (video_id, video_title) in enumerate(entries):
-            video_url = f"https://www.youtube.com/watch?v={video_id}"
-            try:
-                ydl.download([video_url])
-                # Find the downloaded file
-                candidates = glob.glob(os.path.join(temp_dir, f"{sanitize_filename(video_title)[:100]}*"))
-                if candidates:
-                    video_files.append(candidates[0])
-                    st.info(f"Downloaded video: '{video_title}'")
-                else:
-                    st.warning(f"Could not locate downloaded file for '{video_title}'")
-            except Exception as e:
-                st.warning(f"Video download failed for '{video_title}': {str(e)}")
-            progress_bar.progress((i + 1) / total)
-    return video_files
-
 @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=1, max=10))
 def download_subtitles(url, format_choice, temp_dir, is_playlist, progress_bar, total_videos,
                        clean_transcript, cookies_file=None, sub_mode='original'):
@@ -617,7 +570,7 @@ def main():
     st.set_page_config(page_title="YouTube Subtitle Downloader", page_icon="🎥", layout="wide")
 
     st.title("🎥 YouTube Subtitle Downloader")
-    st.caption("Download subtitles from YouTube videos, playlists, and channels — with optional video downloads.")
+    st.caption("Download subtitles from YouTube videos, playlists, and channels.")
 
     # =========================================================================
     # Mode selection — single source of truth (no separate tabs + radio)
@@ -796,7 +749,7 @@ def main():
     # =========================================================================
     # Shared settings — laid out as horizontal radio bars in the main area
     # =========================================================================
-    with st.expander("⚙️ Shared Settings (format, language, cookies, video quality)", expanded=True):
+    with st.expander("⚙️ Shared Settings (format, language, cookies)", expanded=True):
         col_a, col_b = st.columns(2)
 
         with col_a:
@@ -811,30 +764,6 @@ def main():
                 horizontal=True, key="lang_mode"
             )
             sub_mode = {'Original Language': 'original', 'English Translation': 'en_translation'}[lang_mode_display]
-
-        st.markdown("---")
-
-        video_download_disabled_modes = ("Channel + Keyword", "Keyword Search")
-        col_c, col_d = st.columns(2)
-        with col_c:
-            download_videos = st.checkbox(
-                "Download Videos Too", value=False,
-                disabled=(mode in video_download_disabled_modes),
-                help="Not available in Channel + Keyword or Keyword Search modes." if mode in video_download_disabled_modes else None,
-                key="download_videos",
-            )
-        quality_options = {
-            "Best Quality": "best",
-            "720p": "best[height<=720]",
-            "480p": "best[height<=480]",
-            "Audio Only": "bestaudio",
-        }
-        with col_d:
-            quality = st.radio(
-                "Video Quality", list(quality_options.keys()), index=0,
-                disabled=not download_videos, horizontal=True, key="quality",
-            )
-        selected_quality = quality_options[quality]
 
         st.markdown("---")
         st.markdown(
@@ -854,7 +783,7 @@ def main():
     # Download button
     # =========================================================================
     st.markdown("---")
-    button_text = "⬇️ Download Videos & Subtitles" if download_videos else "⬇️ Download Subtitles"
+    button_text = "⬇️ Download Subtitles"
     if st.button(button_text, type="primary", use_container_width=True):
 
         # ── Keyword Search mode ─────────────────────────────────────────────────
@@ -1126,31 +1055,18 @@ def main():
                     except Exception as e:
                         st.warning(f"⚠️ Error for '{vid_title}': {str(e)}")
 
-                    if not download_videos:
-                        progress_bar.progress((i + 1) / total_videos)
-
-                # Optional video download
-                video_files = []
-                if download_videos:
-                    entries_for_dl = [(vid_id, vtitle) for vid_id, vtitle, _ in meta_list]
-                    st.write("Downloading video files...")
-                    video_files = download_videos_yt_dlp(
-                        entries_for_dl, valid_video_urls[0], selected_quality,
-                        cookies_file, temp_dir, progress_bar)
+                    progress_bar.progress((i + 1) / total_videos)
 
                 progress_bar.progress(1.0)
 
-                if not subtitle_files and not video_files:
+                if not subtitle_files:
                     st.error("Nothing was downloaded. Try different URLs or upload cookies.")
                     return
 
                 st.success(f"Done! Got subtitles for {len(subtitle_files)}/{total_videos} video(s).")
                 mime_type = get_mime_type(format_choice)
 
-                if download_videos:
-                    zip_buffer, zip_name = create_video_zip(video_files, subtitle_files, "multi_video")
-                    st.download_button("📦 Download Videos + Subs ZIP", zip_buffer, zip_name, "application/zip")
-                elif total_videos == 1 and subtitle_files:
+                if total_videos == 1 and subtitle_files:
                     # Single video — always just one file
                     _, sub_text = subtitle_files[0]
                     fname = f"{sanitize_filename(subtitle_files[0][0])[:150]}.{format_choice}"
@@ -1269,29 +1185,18 @@ def main():
                     except Exception as e:
                         st.warning(f"⚠️ Error for '{video_title}': {str(e)}")
 
-                    if not download_videos:
-                        progress_bar.progress((i + 1) / total_videos)
-
-                video_files = []
-                if download_videos:
-                    st.write("Downloading video files...")
-                    video_files = download_videos_yt_dlp(
-                        entries, selected_url, selected_quality, cookies_file, temp_dir, progress_bar)
+                    progress_bar.progress((i + 1) / total_videos)
 
                 progress_bar.progress(1.0)
 
-                if not subtitle_files and not video_files:
+                if not subtitle_files:
                     st.error("Nothing was downloaded. Try a different URL or upload cookies.")
                     return
 
                 st.success(f"Done! Got subtitles for {len(subtitle_files)}/{total_videos} video(s).")
                 mime_type = get_mime_type(format_choice)
 
-                if download_videos:
-                    zip_buffer, zip_name = create_video_zip(video_files, subtitle_files, playlist_title)
-                    st.download_button("📦 Download Videos + Subs ZIP", zip_buffer, zip_name, "application/zip")
-
-                elif is_playlist:
+                if is_playlist:
                     if combine_choice == 'combined':
                         combined = combine_subtitles(subtitle_files, temp_dir, playlist_title, format_choice)
                         with open(combined, 'rb') as f:

@@ -739,7 +739,7 @@ def main():
         with col_n:
             search_max_results = st.number_input(
                 "Number of videos", min_value=1, max_value=500, value=10, step=1,
-                help="Top N YouTube search results (in the chosen sort order) to fetch subtitles for. Maximum 500."
+                help="Top YouTube search results (in the chosen sort order) to fetch subtitles for. Maximum 500."
             )
         search_combine_choice = st.radio(
             "Output", ["separate", "combined"], key="search_combine", horizontal=True

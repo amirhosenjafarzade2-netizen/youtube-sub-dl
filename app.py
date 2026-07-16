@@ -713,7 +713,6 @@ def main():
     elif mode == "Keyword Search":
         st.caption(
             "Search all of YouTube for a keyword/phrase and download subtitles "
-            "for the top N results — no channel needed."
         )
         search_query = st.text_input(
             "Search keyword(s)", placeholder="e.g. python tutorial for beginners", key="search_query"

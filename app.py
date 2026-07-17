@@ -566,11 +566,165 @@ def prepend_video_header(sub_text, video_title, channel_name):
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
+def _inject_theme():
+    st.markdown("""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap');
+
+    :root{
+        --bg:#0e1016; --bg-glow:#171b28;
+        --surface:#161a24; --surface-2:#1d212d;
+        --border:#2a2f3e; --border-soft:#232735;
+        --text:#eceef3; --text-dim:#9aa0b4;
+        --accent:#f2b84b; --accent-dark:#d9922e;
+        --accent-2:#3fbfad; --accent-2-dark:#2f9385;
+        --danger:#ff6b6b; --success:#4ad9a3; --info:#5aa9e6;
+        --radius:12px;
+    }
+
+    html, body, [class^="css"], [class*=" css"]{ font-family:'Inter', sans-serif; }
+    .stApp{
+        background:
+          radial-gradient(circle at 12% -10%, rgba(242,184,75,.08) 0%, transparent 38%),
+          radial-gradient(circle at 88% 0%, rgba(63,191,173,.07) 0%, transparent 40%),
+          var(--bg);
+        color: var(--text);
+    }
+    header[data-testid="stHeader"]{ background: rgba(14,16,22,.6); backdrop-filter: blur(6px); }
+    footer{ visibility:hidden; }
+    #MainMenu{ visibility:hidden; }
+
+    h1,h2,h3, .hero-title{ font-family:'Space Grotesk', sans-serif; letter-spacing:-0.01em; }
+    p, span, label, div{ letter-spacing:0.1px; }
+
+    /* ---------- Hero ---------- */
+    .hero{ text-align:center; padding: 30px 10px 14px; }
+    .hero-badge{
+        display:inline-flex; align-items:center; justify-content:center;
+        gap:6px; padding:6px 14px; margin-bottom:16px;
+        background:linear-gradient(135deg, var(--accent), var(--accent-dark));
+        color:#191204; font-weight:700; font-size:12px; letter-spacing:1.6px;
+        border-radius:999px; box-shadow:0 6px 18px rgba(242,184,75,.28);
+        font-family:'Space Grotesk', sans-serif;
+    }
+    .hero-title{
+        font-size:2.5rem; font-weight:700; margin:4px 0 0 0; color:var(--text);
+    }
+    .hero-sub{ color:var(--text-dim); font-size:1.02rem; margin-top:10px; font-weight:400; }
+
+    /* ---------- Film-strip divider (signature element) ---------- */
+    .film-divider{
+        position:relative; height:20px; margin:26px 0 22px;
+        background-image: radial-gradient(circle, var(--border) 2.6px, transparent 2.8px);
+        background-size:20px 20px; background-position:center; background-repeat:repeat-x;
+        opacity:.85;
+    }
+    .film-divider::before, .film-divider::after{
+        content:""; position:absolute; left:0; right:0; height:1px; background:var(--border-soft);
+    }
+    .film-divider::before{ top:3px; } .film-divider::after{ bottom:3px; }
+
+    /* ---------- Radio pills (segmented control) ---------- */
+    div[data-testid="stRadio"] > label{ color:var(--text-dim) !important; font-weight:600; font-size:0.85rem; text-transform:uppercase; letter-spacing:.6px; }
+    div[data-testid="stRadio"] > div[role="radiogroup"]{
+        gap:8px; flex-wrap:wrap;
+    }
+    div[data-testid="stRadio"] label[data-baseweb="radio"]{
+        background:var(--surface); border:1px solid var(--border);
+        padding:9px 16px; border-radius:10px; transition:all .18s ease;
+        margin-right:0 !important;
+    }
+    div[data-testid="stRadio"] label[data-baseweb="radio"]:hover{
+        border-color:var(--accent); background:var(--surface-2);
+    }
+    div[data-testid="stRadio"] label[data-baseweb="radio"]:has(input:checked){
+        background:linear-gradient(135deg, var(--accent), var(--accent-dark));
+        border-color:var(--accent);
+        box-shadow:0 3px 12px rgba(242,184,75,.28);
+    }
+    div[data-testid="stRadio"] label[data-baseweb="radio"]:has(input:checked) div[data-testid="stMarkdownContainer"] p{
+        color:#191204 !important; font-weight:700;
+    }
+    div[data-testid="stRadio"] label[data-baseweb="radio"] div:first-child{
+        border-color: var(--text-dim) !important;
+    }
+    div[data-testid="stRadio"] label[data-baseweb="radio"]:has(input:checked) div:first-child{
+        border-color:#191204 !important;
+    }
+
+    /* ---------- Buttons ---------- */
+    .stButton button, .stDownloadButton button{
+        border-radius:10px; border:1px solid var(--border); background:var(--surface-2);
+        color:var(--text); font-weight:600; transition:all .18s ease;
+    }
+    .stButton button:hover, .stDownloadButton button:hover{
+        border-color:var(--accent-2); color:var(--accent-2); transform:translateY(-1px);
+    }
+    button[kind="primary"]{
+        background:linear-gradient(135deg, var(--accent), var(--accent-dark)) !important;
+        border:none !important; color:#191204 !important; font-weight:700 !important;
+        box-shadow:0 6px 20px rgba(242,184,75,.32);
+    }
+    button[kind="primary"]:hover{ filter:brightness(1.07); color:#191204 !important; transform:translateY(-1px); }
+
+    /* ---------- Inputs ---------- */
+    .stTextInput input, .stNumberInput input{
+        background:var(--surface) !important; border:1px solid var(--border) !important;
+        border-radius:10px !important; color:var(--text) !important;
+    }
+    .stTextInput input:focus, .stNumberInput input:focus{
+        border-color:var(--accent) !important; box-shadow:0 0 0 3px rgba(242,184,75,.14) !important;
+    }
+    .stTextInput input::placeholder{ color:var(--text-dim) !important; }
+
+    input[type="checkbox"]{ accent-color:var(--accent); }
+
+    /* ---------- Expander (Shared Settings card) ---------- */
+    div[data-testid="stExpander"]{
+        border:1px solid var(--border); border-radius:14px; background:var(--surface);
+        overflow:hidden;
+    }
+    div[data-testid="stExpander"] summary{
+        background:var(--surface-2); font-weight:600; font-family:'Space Grotesk', sans-serif;
+    }
+
+    /* ---------- File uploader ---------- */
+    [data-testid="stFileUploaderDropzone"]{
+        background:var(--surface) !important; border:1.5px dashed var(--border) !important;
+        border-radius:12px !important;
+    }
+
+    /* ---------- Progress bar ---------- */
+    .stProgress > div > div > div > div{
+        background:linear-gradient(90deg, var(--accent-2), var(--accent)) !important;
+    }
+
+    /* ---------- Alerts ---------- */
+    div[data-testid="stAlertContainer"], .stAlert{
+        border-radius:10px !important; border:1px solid var(--border-soft) !important;
+    }
+
+    /* ---------- Columns spacing polish ---------- */
+    div[data-testid="stVerticalBlock"] > div{ gap:0.4rem; }
+    </style>
+    """, unsafe_allow_html=True)
+
+
+def _film_divider():
+    st.markdown('<div class="film-divider"></div>', unsafe_allow_html=True)
+
+
 def main():
     st.set_page_config(page_title="YouTube Subtitle Downloader", page_icon="🎥", layout="wide")
+    _inject_theme()
 
-    st.title("🎥 YouTube Subtitle Downloader")
-    st.caption("Download subtitles from YouTube videos, playlists, and channels.")
+    st.markdown("""
+    <div class="hero">
+        <div class="hero-badge">CC · SUBTITLES</div>
+        <h1 class="hero-title">YouTube Subtitle Downloader</h1>
+        <p class="hero-sub">Pull clean, translated, or original-language captions from any video, playlist, or channel.</p>
+    </div>
+    """, unsafe_allow_html=True)
 
     # =========================================================================
     # Mode selection — single source of truth (no separate tabs + radio)
@@ -603,7 +757,7 @@ def main():
     channel_range_start = 1
     channel_range_end = 50
 
-    st.markdown("---")
+    _film_divider()
 
     # ── Playlist / Channel ──────────────────────────────────────────────────
     if mode == "Playlist / Channel":
@@ -764,7 +918,7 @@ def main():
             )
             sub_mode = {'Original Language': 'original', 'English Translation': 'en_translation'}[lang_mode_display]
 
-        st.markdown("---")
+        _film_divider()
         st.markdown(
             "**For Age-Restricted Videos**: Upload cookies to bypass blocks.\n"
             "1. Use the \"Get cookies.txt LOCALLY\" browser extension.\n"
@@ -781,7 +935,7 @@ def main():
     # =========================================================================
     # Download button
     # =========================================================================
-    st.markdown("---")
+    _film_divider()
     button_text = "⬇️ Download Subtitles"
     if st.button(button_text, type="primary", use_container_width=True):
 

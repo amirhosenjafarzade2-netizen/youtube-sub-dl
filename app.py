@@ -30,6 +30,8 @@ import zipfile
 import re
 import glob
 import time
+import threading
+import concurrent.futures
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 import urllib.request
 import urllib.error
@@ -174,14 +176,26 @@ def _pick_original_transcript(transcript_list):
 # transcript fetches (playlists/channels/searches) could trip 429s that were
 # never retried.
 
+# SPEED: videos are now fetched several at a time (see _download_many below)
+# instead of strictly one-at-a-time, which is the main speedup. To keep that
+# safe, two separate knobs share the load instead of one big serial sleep:
+#   - _YT_SEMAPHORE caps how many requests are ever in flight at once.
+#   - _pace_youtube_request still staggers request *starts* a little, but the
+#     interval is much smaller now (0.35s vs the old 1.2s) since concurrency
+#     limiting (not pure serialization) is what's actually protecting us.
+_MAX_CONCURRENT_REQUESTS = 5
+_YT_SEMAPHORE = threading.Semaphore(_MAX_CONCURRENT_REQUESTS)
+
 _LAST_YT_REQUEST_TIME = [0.0]
-_YT_MIN_INTERVAL = 1.2  # seconds enforced between consecutive YouTube requests
+_YT_MIN_INTERVAL = 0.35  # seconds staggered between request *starts* across all threads
+_YT_PACE_LOCK = threading.Lock()
 
 def _pace_youtube_request():
-    elapsed = time.monotonic() - _LAST_YT_REQUEST_TIME[0]
-    if elapsed < _YT_MIN_INTERVAL:
-        time.sleep(_YT_MIN_INTERVAL - elapsed)
-    _LAST_YT_REQUEST_TIME[0] = time.monotonic()
+    with _YT_PACE_LOCK:
+        elapsed = time.monotonic() - _LAST_YT_REQUEST_TIME[0]
+        if elapsed < _YT_MIN_INTERVAL:
+            time.sleep(_YT_MIN_INTERVAL - elapsed)
+        _LAST_YT_REQUEST_TIME[0] = time.monotonic()
 
 # Kept as an alias so the existing translation-pacing calls below still work
 # unchanged, but now share the same clock as everything else.
@@ -665,6 +679,93 @@ def _try_fetch_subs(video_id, video_url_item, format_choice, sub_mode, cookies_f
             raise ValueError(f"API: {api_exc} | yt-dlp: {dlp_exc}")
 
 
+def _fetch_one_video(video_id, video_title, video_url, format_choice, sub_mode,
+                      cookies_file, temp_dir, clean_transcript, header_info=None):
+    """Worker for one video — runs inside a background thread, so it must
+    never call any st.* function. Returns a plain dict describing the outcome;
+    the caller reports it to the UI afterward, in the main thread."""
+    try:
+        with _YT_SEMAPHORE:
+            sub_text, lang_code, is_auto, fallback_used, _api_exc = _try_fetch_subs(
+                video_id, video_url, format_choice, sub_mode, cookies_file, temp_dir)
+
+        if clean_transcript:
+            sub_text = clean_subtitle_text(sub_text)
+        if format_choice == 'txt':
+            sub_text = convert_srt_to_txt(sub_text)
+            if header_info:
+                sub_text = prepend_video_header(sub_text, header_info[0], header_info[1])
+
+        return {
+            'ok': True, 'title': video_title, 'sub_text': sub_text,
+            'lang_code': lang_code, 'is_auto': is_auto, 'fallback_used': fallback_used,
+        }
+    except ValueError as ve:
+        return {'ok': False, 'title': video_title, 'error': str(ve)}
+    except Exception as e:
+        return {'ok': False, 'title': video_title, 'error': f"{type(e).__name__}: {e}"}
+
+
+def _download_many(entries, format_choice, sub_mode, cookies_file, temp_dir,
+                    clean_transcript, progress_bar, header_lookup=None,
+                    max_workers=_MAX_CONCURRENT_REQUESTS):
+    """Fetch subtitles for a list of (video_id, video_title) tuples concurrently.
+    This is the main speedup: videos are downloaded several at a time instead
+    of strictly one after another. Results are returned in the SAME order as
+    `entries` (not completion order), so callers can report them predictably.
+
+    `header_lookup(video_id)` -> (title, channel) or None, used to prepend
+    txt headers in multi-video mode without an extra sequential round trip.
+    """
+    total = len(entries)
+    results = [None] * total
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        future_to_idx = {}
+        for i, (video_id, video_title) in enumerate(entries):
+            video_url = f"https://www.youtube.com/watch?v={video_id}"
+            header_info = header_lookup(video_id) if header_lookup else None
+            fut = ex.submit(
+                _fetch_one_video, video_id, video_title, video_url,
+                format_choice, sub_mode, cookies_file, temp_dir, clean_transcript, header_info,
+            )
+            future_to_idx[fut] = i
+
+        done = 0
+        # as_completed() runs in THIS (main) thread, so progress_bar updates here are safe —
+        # only the actual network work happens in the background workers.
+        for fut in concurrent.futures.as_completed(future_to_idx):
+            idx = future_to_idx[fut]
+            try:
+                results[idx] = fut.result()
+            except Exception as e:
+                results[idx] = {'ok': False, 'title': entries[idx][1], 'error': f"{type(e).__name__}: {e}"}
+            done += 1
+            progress_bar.progress(done / total)
+
+    return results
+
+
+def _report_results(results):
+    """Print the st.info/st.warning lines for a batch of _download_many results,
+    in original order, and return the list of (title, sub_text) for successes."""
+    subtitle_files = []
+    for r in results:
+        if r['ok']:
+            subtitle_files.append((r['title'], r['sub_text']))
+            lang_name = format_language_option(r['lang_code'])
+            auto_note = ' (Auto-generated)' if r['is_auto'] else ''
+            source_note = ' (via yt-dlp)' if r['fallback_used'] else ''
+            st.info(f"✓ '{r['title']}' — {lang_name}{auto_note}{source_note}")
+        else:
+            msg = r['error'].lower()
+            if "age-restricted" in msg or "access denied" in msg:
+                st.warning(f"⚠️ '{r['title']}' is age-restricted. Upload cookies to access.")
+            else:
+                st.warning(f"⚠️ No subs for '{r['title']}': {r['error']}")
+    return subtitle_files
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -914,33 +1015,9 @@ def main():
             progress_bar = st.progress(0.0)
 
             with tempfile.TemporaryDirectory() as temp_dir:
-                subtitle_files = []
-                for i, (video_id, video_title) in enumerate(entries):
-                    video_url_item = f"https://www.youtube.com/watch?v={video_id}"
-                    try:
-                        sub_text, lang_code, is_auto, fallback_used, api_exc = _try_fetch_subs(
-                            video_id, video_url_item, format_choice, sub_mode, cookies_file, temp_dir)
-
-                        if clean_transcript:
-                            sub_text = clean_subtitle_text(sub_text)
-                        if format_choice == 'txt':
-                            sub_text = convert_srt_to_txt(sub_text)
-
-                        subtitle_files.append((video_title, sub_text))
-                        lang_name = format_language_option(lang_code)
-                        auto_note = ' (Auto-generated)' if is_auto else ''
-                        source_note = ' (via yt-dlp)' if fallback_used else ''
-                        st.info(f"✓ '{video_title}' — {lang_name}{auto_note}{source_note}")
-                    except ValueError as ve:
-                        msg = str(ve).lower()
-                        if "age-restricted" in msg or "access denied" in msg:
-                            st.warning(f"⚠️ '{video_title}' is age-restricted. Upload cookies to access.")
-                        else:
-                            st.warning(f"⚠️ No subs for '{video_title}': {str(ve)}")
-                    except Exception as e:
-                        st.warning(f"⚠️ Error for '{video_title}': {type(e).__name__}: {str(e)}")
-
-                    progress_bar.progress((i + 1) / total_videos)
+                results = _download_many(entries, format_choice, sub_mode, cookies_file,
+                                         temp_dir, clean_transcript, progress_bar)
+                subtitle_files = _report_results(results)
 
                 if not subtitle_files:
                     st.error("Nothing was downloaded.")
@@ -1023,33 +1100,9 @@ def main():
             progress_bar = st.progress(0.0)
 
             with tempfile.TemporaryDirectory() as temp_dir:
-                subtitle_files = []
-                for i, (video_id, video_title) in enumerate(filtered_entries):
-                    video_url_item = f"https://www.youtube.com/watch?v={video_id}"
-                    try:
-                        sub_text, lang_code, is_auto, fallback_used, api_exc = _try_fetch_subs(
-                            video_id, video_url_item, format_choice, sub_mode, cookies_file, temp_dir)
-
-                        if clean_transcript:
-                            sub_text = clean_subtitle_text(sub_text)
-                        if format_choice == 'txt':
-                            sub_text = convert_srt_to_txt(sub_text)
-
-                        subtitle_files.append((video_title, sub_text))
-                        lang_name = format_language_option(lang_code)
-                        auto_note = ' (Auto-generated)' if is_auto else ''
-                        source_note = ' (via yt-dlp)' if fallback_used else ''
-                        st.info(f"✓ '{video_title}' — {lang_name}{auto_note}{source_note}")
-                    except ValueError as ve:
-                        msg = str(ve).lower()
-                        if "age-restricted" in msg or "access denied" in msg:
-                            st.warning(f"⚠️ '{video_title}' is age-restricted. Upload cookies to access.")
-                        else:
-                            st.warning(f"⚠️ No subs for '{video_title}': {str(ve)}")
-                    except Exception as e:
-                        st.warning(f"⚠️ Error for '{video_title}': {type(e).__name__}: {str(e)}")
-
-                    progress_bar.progress((i + 1) / total_videos)
+                results = _download_many(filtered_entries, format_choice, sub_mode, cookies_file,
+                                         temp_dir, clean_transcript, progress_bar)
+                subtitle_files = _report_results(results)
 
                 if not subtitle_files:
                     st.error("Nothing was downloaded.")
@@ -1100,49 +1153,31 @@ def main():
             progress_bar = st.progress(0.0)
 
             with tempfile.TemporaryDirectory() as temp_dir:
-                subtitle_files = []   # list of (video_title, sub_text)
-                # We also store channel info for txt headers
-                meta_list = []        # list of (video_id, title, channel)
+                # Fetch title + channel metadata for all videos concurrently first
+                # (only needed for txt headers / nicer filenames), instead of one
+                # blocking round trip per video before its subtitles can even start.
+                video_ids = [extract_video_id(u) for u in valid_video_urls]
+                meta = {}  # video_id -> (title, channel)
 
-                for i, video_url_item in enumerate(valid_video_urls):
-                    video_id = extract_video_id(video_url_item)
-                    # Fetch metadata (title + channel)
+                def _fetch_meta(idx_url):
+                    idx, u = idx_url
                     try:
-                        _, vid_title, channel_name = get_multi_video_info(video_url_item, cookies_file)
+                        _, t, c = get_multi_video_info(u, cookies_file)
+                        return video_ids[idx], t, c
                     except Exception:
-                        vid_title = f"Video {i+1}"
-                        channel_name = "Unknown Channel"
+                        return video_ids[idx], f"Video {idx+1}", "Unknown Channel"
 
-                    meta_list.append((video_id, vid_title, channel_name))
+                with concurrent.futures.ThreadPoolExecutor(max_workers=_MAX_CONCURRENT_REQUESTS) as ex:
+                    for vid, title, channel in ex.map(_fetch_meta, list(enumerate(valid_video_urls))):
+                        meta[vid] = (title, channel)
 
-                    try:
-                        sub_text, lang_code, is_auto, fallback_used, api_exc = _try_fetch_subs(
-                            video_id, video_url_item, format_choice, sub_mode, cookies_file, temp_dir)
+                entries = [(vid, meta[vid][0]) for vid in video_ids]
+                header_lookup = (lambda vid: meta.get(vid)) if format_choice == 'txt' else None
 
-                        if clean_transcript:
-                            sub_text = clean_subtitle_text(sub_text)
-                        if format_choice == 'txt':
-                            sub_text = convert_srt_to_txt(sub_text)
-                            # Prepend video title and channel name for txt
-                            sub_text = prepend_video_header(sub_text, vid_title, channel_name)
-
-                        subtitle_files.append((vid_title, sub_text))
-                        lang_name = format_language_option(lang_code)
-                        auto_note = ' (Auto-generated)' if is_auto else ''
-                        source_note = ' (yt-dlp)' if fallback_used else ''
-                        st.info(f"✓ Subs: '{vid_title}' [{channel_name}] — {lang_name}{auto_note}{source_note}")
-                    except ValueError as ve:
-                        msg = str(ve).lower()
-                        if "age-restricted" in msg or "access denied" in msg:
-                            st.warning(f"⚠️ '{vid_title}' is age-restricted. Upload cookies to access.")
-                        else:
-                            st.warning(f"⚠️ No subs for '{vid_title}': {str(ve)}")
-                    except Exception as e:
-                        st.warning(f"⚠️ Error for '{vid_title}': {type(e).__name__}: {str(e)}")
-
-                    progress_bar.progress((i + 1) / total_videos)
-
-                progress_bar.progress(1.0)
+                results = _download_many(entries, format_choice, sub_mode, cookies_file,
+                                         temp_dir, clean_transcript, progress_bar,
+                                         header_lookup=header_lookup)
+                subtitle_files = _report_results(results)
 
                 if not subtitle_files:
                     st.error("Nothing was downloaded. Try different URLs or upload cookies.")
@@ -1239,35 +1274,9 @@ def main():
 
         with tempfile.TemporaryDirectory() as temp_dir:
             try:
-                subtitle_files = []
-                for i, (video_id, video_title) in enumerate(entries):
-                    video_url_item = f"https://www.youtube.com/watch?v={video_id}"
-                    try:
-                        sub_text, lang_code, is_auto, fallback_used, api_exc = _try_fetch_subs(
-                            video_id, video_url_item, format_choice, sub_mode, cookies_file, temp_dir)
-
-                        if clean_transcript:
-                            sub_text = clean_subtitle_text(sub_text)
-                        if format_choice == 'txt':
-                            sub_text = convert_srt_to_txt(sub_text)
-
-                        subtitle_files.append((video_title, sub_text))
-                        lang_name = format_language_option(lang_code)
-                        auto_note = ' (Auto-generated)' if is_auto else ''
-                        source_note = ' (yt-dlp)' if fallback_used else ''
-                        st.info(f"✓ Subs: '{video_title}' — {lang_name}{auto_note}{source_note}")
-                    except ValueError as ve:
-                        msg = str(ve).lower()
-                        if "age-restricted" in msg or "access denied" in msg:
-                            st.warning(f"⚠️ '{video_title}' is age-restricted. Upload cookies to access.")
-                        else:
-                            st.warning(f"⚠️ No subs for '{video_title}': {str(ve)}")
-                    except Exception as e:
-                        st.warning(f"⚠️ Error for '{video_title}': {type(e).__name__}: {str(e)}")
-
-                    progress_bar.progress((i + 1) / total_videos)
-
-                progress_bar.progress(1.0)
+                results = _download_many(entries, format_choice, sub_mode, cookies_file,
+                                         temp_dir, clean_transcript, progress_bar)
+                subtitle_files = _report_results(results)
 
                 if not subtitle_files:
                     st.error("Nothing was downloaded. Try a different URL or upload cookies.")

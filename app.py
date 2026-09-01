@@ -198,17 +198,28 @@ def _is_rate_limit_error(exc):
         or 'ratelimit' in type(exc).__name__.lower()
     )
 
-@retry(stop=stop_after_attempt(4), wait=wait_exponential(multiplier=1, min=2, max=20))
+# youtube_transcript_api v1.0+ made this an INSTANCE method (`YouTubeTranscriptApi().list(...)`)
+# instead of the old classmethod `YouTubeTranscriptApi.list_transcripts(...)`. Calling the old
+# classmethod against the new library raises AttributeError deep inside, which tenacity's
+# @retry then wraps as "RetryError[... raised AttributeError]" — that's the exact error you hit.
+# Non-transient errors (AttributeError, TypeError, "no transcript" errors) are NOT retried;
+# only genuine rate-limit-shaped errors are, so a broken API call fails fast instead of
+# burning through 4 retries for nothing.
+_YTT_API = YouTubeTranscriptApi()
+
 def _fetch_transcript_list_paced(video_id):
-    _pace_youtube_request()
-    try:
-        return YouTubeTranscriptApi.list_transcripts(video_id)
-    except Exception as e:
-        if _is_rate_limit_error(e):
-            raise  # let @retry back off and try again
-        raise  # tenacity will still retry transient errors; non-transient ones
-               # (no transcript, disabled, etc.) will exhaust retries fast enough
-               # to not matter, but see get_transcript_api which re-raises as ValueError
+    last_exc = None
+    for attempt in range(4):
+        _pace_youtube_request()
+        try:
+            return _YTT_API.list(video_id)
+        except Exception as e:
+            last_exc = e
+            if _is_rate_limit_error(e) and attempt < 3:
+                time.sleep(min(2 ** attempt * 2, 20))
+                continue
+            raise
+    raise last_exc
 
 def get_transcript_api(video_id, format_choice='srt', mode='original'):
     """

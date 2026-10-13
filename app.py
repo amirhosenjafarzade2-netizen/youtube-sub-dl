@@ -1,27 +1,27 @@
 """
 YouTube Subtitle Downloader — Streamlit app
 
-FIXES vs. previous version (why "new videos" were failing):
-  1. `youtube_transcript_api` calls had no pacing/retry, so on any burst of
-     requests (playlists, channels, searches) YouTube would start returning
-     429s / empty responses, which surfaced as a generic "API error" and
-     silently fell through to the yt-dlp path — which then *also* got rate
-     limited, since both paths hit YouTube from the same IP back-to-back.
-  2. Errors shown to the user were collapsed into a vague string, making it
-     impossible to tell "no captions exist yet" apart from "we got blocked."
-     Now the real exception type + message is shown.
-  3. Added the same pacing helper used for translation requests to the
-     regular transcript-fetch path too.
-  4. `get_transcript_api` now retries transient failures with backoff
-     instead of immediately handing off to yt-dlp.
+Changes in this version (age-restriction / "upload cookies" fixes):
+  1. Errors are now CLASSIFIED (age / bot-or-ip-block / disabled / unavailable /
+     no_subs / other) instead of everything from youtube_transcript_api being
+     reported as "age-restricted". The UI message is chosen from the real kind.
+  2. When cookies ARE uploaded and a video is age-gated, yt-dlp is retried with
+     alternate player clients that accept cookies for age-gated videos.
+  3. Every yt-dlp call gets its OWN copy of the cookie file (yt-dlp rewrites the
+     file on close; parallel threads sharing one file could corrupt it) and its
+     OWN work folder (parallel threads used to glob each other's subtitle files).
+  4. Uploaded cookies are inspected (Netscape format, youtube.com entries, login
+     cookies present) so a bad cookie file is reported immediately.
+  5. Fixed rate-limit detection matching the substring 'rate' inside words like
+     "generated".
 
-IMPORTANT — do this first before anything else:
+IMPORTANT — do this first:
     pip install -U youtube-transcript-api yt-dlp
 
-`yt-dlp` in particular breaks against YouTube's current internal API within
-weeks of a release, since YouTube changes it often. If subtitles for videos
-that are more than a few days old also fail, an outdated yt-dlp/library pin
-is almost always the cause, not this script.
+For age-restricted videos, cookies must come from a LOGGED-IN, age-verified
+Google account. Export them from a private/incognito window and close it right
+after exporting (YouTube rotates cookies of open sessions, which invalidates
+the exported file).
 """
 
 import streamlit as st
@@ -30,7 +30,9 @@ import zipfile
 import re
 import glob
 import time
+import shutil
 import threading
+import contextlib
 import concurrent.futures
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 import urllib.request
@@ -41,10 +43,13 @@ import tempfile
 from io import BytesIO
 import logging
 from tenacity import retry, stop_after_attempt, wait_exponential
-from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound, CouldNotRetrieveTranscript
+from youtube_transcript_api import YouTubeTranscriptApi, NoTranscriptFound
 from youtube_transcript_api.formatters import SRTFormatter, WebVTTFormatter
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.WARNING)
+
+_UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+       '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
 
 LANGUAGE_NAMES = {
     'en': 'English',
@@ -85,6 +90,109 @@ LANGUAGE_NAMES = {
 
 def format_language_option(code):
     return LANGUAGE_NAMES.get(code, code.upper() if code else 'Unknown')
+
+
+# ─── Error classification ────────────────────────────────────────────────────
+
+class SubtitleError(ValueError):
+    """ValueError carrying a `kind` so the UI can show an accurate message.
+    kinds: 'age', 'blocked', 'disabled', 'unavailable', 'no_subs', 'other'"""
+    def __init__(self, kind, message):
+        super().__init__(message)
+        self.kind = kind
+
+_AGE_PHRASES = (
+    'confirm your age', 'age-restricted', 'age restricted', 'age-gated',
+    'inappropriate for some users', 'age verification',
+)
+_BOT_PHRASES = (
+    "not a bot", 'sign in to confirm', 'too many requests', '429',
+    'requests from your ip', 'ip has been blocked', 'blocking requests',
+)
+_UNAVAILABLE_PHRASES = (
+    'private video', 'video unavailable', 'video is unavailable', 'has been removed',
+    'this video is not available', 'account associated with this video has been terminated',
+)
+
+def _short(exc, limit=300):
+    """Collapse whitespace so multi-line library errors fit in one UI line."""
+    text = re.sub(r'\s+', ' ', str(exc)).strip()
+    return text if len(text) <= limit else text[:limit] + '…'
+
+def classify_error(exc):
+    name = type(exc).__name__
+    msg = str(exc).lower()
+    if name == 'AgeRestricted' or any(p in msg for p in _AGE_PHRASES):
+        return 'age'
+    if name in ('IpBlocked', 'RequestBlocked') or any(p in msg for p in _BOT_PHRASES):
+        return 'blocked'
+    if name == 'TranscriptsDisabled' or 'subtitles are disabled' in msg:
+        return 'disabled'
+    if name in ('VideoUnavailable', 'VideoUnplayable', 'InvalidVideoId') or any(p in msg for p in _UNAVAILABLE_PHRASES):
+        return 'unavailable'
+    if name in ('NoTranscriptFound', 'NotTranslatable', 'TranslationLanguageNotAvailable') \
+            or 'no subtitles' in msg or 'no transcript' in msg:
+        return 'no_subs'
+    return 'other'
+
+def _wrap_exc(exc):
+    if isinstance(exc, SubtitleError):
+        return exc
+    return SubtitleError(classify_error(exc), f"{type(exc).__name__}: {_short(exc)}")
+
+def _merge_errors(api_exc, dlp_exc):
+    """Decide the single most truthful kind when BOTH the API and yt-dlp failed."""
+    if dlp_exc.kind in ('no_subs', 'disabled', 'unavailable'):
+        # yt-dlp reached the video itself, so access isn't the problem.
+        kind = dlp_exc.kind
+    elif 'age' in (api_exc.kind, dlp_exc.kind):
+        kind = 'age'
+    elif dlp_exc.kind != 'other':
+        kind = dlp_exc.kind
+    else:
+        kind = api_exc.kind
+    return SubtitleError(kind, f"API: {api_exc} | yt-dlp: {dlp_exc}")
+
+
+# ─── Cookie helpers ──────────────────────────────────────────────────────────
+
+_LOGIN_COOKIE_NAMES = {'SID', 'SAPISID', '__Secure-1PSID', '__Secure-3PSID', 'LOGIN_INFO'}
+
+def inspect_cookies(data: bytes):
+    """Return (header_ok, n_youtube_cookies, has_login_cookie)."""
+    text = data.decode('utf-8', errors='replace')
+    first = text.lstrip().splitlines()[0] if text.strip() else ''
+    header_ok = 'netscape' in first.lower() or 'http cookie file' in first.lower()
+    n_yt, names = 0, set()
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith('#HttpOnly_'):
+            line = line[len('#HttpOnly_'):]
+        elif not line or line.startswith('#'):
+            continue
+        if 'youtube.com' not in line and 'google.com' not in line:
+            continue
+        parts = line.split('\t')
+        if len(parts) >= 7:
+            if 'youtube.com' in parts[0]:
+                n_yt += 1
+            names.add(parts[5])
+    return header_ok, n_yt, bool(names & _LOGIN_COOKIE_NAMES)
+
+@contextlib.contextmanager
+def _cookie_copy(cookies_file):
+    """Give each yt-dlp call a private copy of the cookie file. yt-dlp rewrites the
+    cookie jar when it closes, so sharing one file between threads can corrupt it."""
+    if not cookies_file or not os.path.exists(cookies_file):
+        yield None
+        return
+    with tempfile.TemporaryDirectory() as d:
+        dst = os.path.join(d, 'cookies.txt')
+        shutil.copyfile(cookies_file, dst)
+        yield dst
+
+
+# ─── URL helpers ─────────────────────────────────────────────────────────────
 
 def is_channel_url(url):
     try:
@@ -146,48 +254,34 @@ def extract_video_id(url):
 
 def get_video_metadata(url, cookies_file=None):
     """Fetch title and channel name for a single video URL."""
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'cookiefile': cookies_file,
-    }
-    with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-        title = info.get('title', 'Unknown Title')
-        channel = info.get('channel', info.get('uploader', 'Unknown Channel'))
-        return title, channel
+    with _cookie_copy(cookies_file) as ck:
+        ydl_opts = {'quiet': True, 'no_warnings': True, 'cookiefile': ck}
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            title = info.get('title', 'Unknown Title')
+            channel = info.get('channel', info.get('uploader', 'Unknown Channel'))
+            return title, channel
 
 def _pick_original_transcript(transcript_list):
     """Prefer a manually-uploaded (creator-added) transcript since that's always in
-    the video's native language. Otherwise fall back to the auto-generated transcript,
-    which is also always in the video's spoken/original language."""
+    the video's native language. Otherwise fall back to the auto-generated transcript."""
     manual = [t for t in transcript_list if not t.is_generated]
     if manual:
         return manual[0]
     generated = [t for t in transcript_list if t.is_generated]
     if generated:
         return generated[0]
-    raise ValueError("No transcript available for this video.")
+    raise SubtitleError('no_subs', "No transcript available for this video.")
+
 
 # ─── Shared pacing so we don't get rate-limited by YouTube ───────────────────
-# Applies to BOTH the youtube_transcript_api path and the manual tlang
-# translation path, since they hit the same YouTube endpoints from the same
-# IP. Previously only the translation path was paced, so bursts of plain
-# transcript fetches (playlists/channels/searches) could trip 429s that were
-# never retried.
-
-# SPEED: videos are now fetched several at a time (see _download_many below)
-# instead of strictly one-at-a-time, which is the main speedup. To keep that
-# safe, two separate knobs share the load instead of one big serial sleep:
-#   - _YT_SEMAPHORE caps how many requests are ever in flight at once.
-#   - _pace_youtube_request still staggers request *starts* a little, but the
-#     interval is much smaller now (0.35s vs the old 1.2s) since concurrency
-#     limiting (not pure serialization) is what's actually protecting us.
+# Videos are fetched several at a time. _YT_SEMAPHORE caps how many requests are
+# in flight at once; _pace_youtube_request staggers request *starts*.
 _MAX_CONCURRENT_REQUESTS = 5
 _YT_SEMAPHORE = threading.Semaphore(_MAX_CONCURRENT_REQUESTS)
 
 _LAST_YT_REQUEST_TIME = [0.0]
-_YT_MIN_INTERVAL = 0.35  # seconds staggered between request *starts* across all threads
+_YT_MIN_INTERVAL = 0.35
 _YT_PACE_LOCK = threading.Lock()
 
 def _pace_youtube_request():
@@ -197,8 +291,6 @@ def _pace_youtube_request():
             time.sleep(_YT_MIN_INTERVAL - elapsed)
         _LAST_YT_REQUEST_TIME[0] = time.monotonic()
 
-# Kept as an alias so the existing translation-pacing calls below still work
-# unchanged, but now share the same clock as everything else.
 _LAST_TRANSLATE_REQUEST_TIME = _LAST_YT_REQUEST_TIME
 _TRANSLATE_MIN_INTERVAL = _YT_MIN_INTERVAL
 
@@ -206,27 +298,27 @@ def _pace_translate_requests():
     _pace_youtube_request()
 
 def _is_rate_limit_error(exc):
+    """True only for genuine HTTP-429-style throttling (NOT IP bans, and no longer
+    matching the substring 'rate' inside words like 'generated')."""
     msg = str(exc).lower()
     return (
-        '429' in msg or 'too many requests' in msg or 'rate' in msg
+        '429' in msg or 'too many requests' in msg
+        or 'rate limit' in msg or 'rate-limit' in msg
         or 'ratelimit' in type(exc).__name__.lower()
     )
 
-# youtube_transcript_api v1.0+ made this an INSTANCE method (`YouTubeTranscriptApi().list(...)`)
-# instead of the old classmethod `YouTubeTranscriptApi.list_transcripts(...)`. Calling the old
-# classmethod against the new library raises AttributeError deep inside, which tenacity's
-# @retry then wraps as "RetryError[... raised AttributeError]" — that's the exact error you hit.
-# Non-transient errors (AttributeError, TypeError, "no transcript" errors) are NOT retried;
-# only genuine rate-limit-shaped errors are, so a broken API call fails fast instead of
-# burning through 4 retries for nothing.
-_YTT_API = YouTubeTranscriptApi()
+def _list_transcripts(video_id):
+    api = YouTubeTranscriptApi()  # one instance per call: no shared state across threads
+    if hasattr(api, 'list'):                      # youtube_transcript_api >= 1.0
+        return api.list(video_id)
+    return YouTubeTranscriptApi.list_transcripts(video_id)  # very old versions
 
 def _fetch_transcript_list_paced(video_id):
     last_exc = None
     for attempt in range(4):
         _pace_youtube_request()
         try:
-            return _YTT_API.list(video_id)
+            return _list_transcripts(video_id)
         except Exception as e:
             last_exc = e
             if _is_rate_limit_error(e) and attempt < 3:
@@ -240,6 +332,7 @@ def get_transcript_api(video_id, format_choice='srt', mode='original'):
     mode:
       'original'       -> fetch the transcript in the video's native/original language
       'en_translation' -> fetch an English transcript, translating on the fly if needed
+    Always raises SubtitleError with an accurate `kind` on failure.
     """
     try:
         transcript_list = _fetch_transcript_list_paced(video_id)
@@ -252,11 +345,10 @@ def get_transcript_api(video_id, format_choice='srt', mode='original'):
                 candidates = list(transcript_list)
                 translatable = [t for t in candidates if t.is_translatable]
                 if not translatable:
-                    raise ValueError(
+                    raise SubtitleError(
+                        'no_subs',
                         "No English transcript exists and none of the available tracks can be machine-translated."
                     )
-                # Auto-generated tracks are almost always translatable; manually-uploaded
-                # ones often aren't, so prefer a translatable auto-generated track first.
                 generated_translatable = [t for t in translatable if t.is_generated]
                 base_transcript = generated_translatable[0] if generated_translatable else translatable[0]
                 transcript = base_transcript.translate('en')
@@ -270,22 +362,17 @@ def get_transcript_api(video_id, format_choice='srt', mode='original'):
         _pace_youtube_request()
         transcript_data = transcript.fetch()
 
-        if format_choice == 'srt':
-            formatter = SRTFormatter()
-        elif format_choice == 'vtt':
-            formatter = WebVTTFormatter()
-        else:
-            formatter = SRTFormatter()
-
+        formatter = WebVTTFormatter() if format_choice == 'vtt' else SRTFormatter()
         sub_text = formatter.format_transcript(transcript_data)
         return sub_text, lang_code, is_auto
 
-    except CouldNotRetrieveTranscript as e:
-        raise ValueError(f"Access denied (age-restricted?): {type(e).__name__}: {str(e)}")
-    except ValueError:
+    except SubtitleError:
         raise
     except Exception as e:
-        raise ValueError(f"API error: {type(e).__name__}: {str(e)}")
+        raise _wrap_exc(e)
+
+
+# ─── VTT → SRT ───────────────────────────────────────────────────────────────
 
 def vtt_to_srt(vtt_text):
     """Convert WebVTT cue text into SRT format (numbered cues, comma decimal separator)."""
@@ -306,7 +393,7 @@ def vtt_to_srt(vtt_text):
                 continue
             if line.strip().upper().startswith(('NOTE', 'STYLE', 'KIND:', 'LANGUAGE:')):
                 continue
-            line = re.sub(r'<[^>]+>', '', line)  # strip vtt tags like <c> and word timestamps
+            line = re.sub(r'<[^>]+>', '', line)
             text_lines.append(line)
         if text_lines:
             srt_blocks.append(f"{counter}\n{start} --> {end}\n" + '\n'.join(text_lines) + "\n")
@@ -315,17 +402,14 @@ def vtt_to_srt(vtt_text):
 
 def _fetch_translated_caption_text(base_url, tlang='en', max_retries=5):
     """Manually request YouTube's on-the-fly caption translation (tlang param) for a
-    given caption track URL, bypassing yt-dlp's own list of pre-known languages.
-    Paces requests and retries with backoff on HTTP 429 (rate limiting)."""
+    given caption track URL. Paces requests and retries with backoff on HTTP 429."""
     parsed = urlparse(base_url)
     qs = parse_qs(parsed.query)
     qs['tlang'] = [tlang]
     qs['fmt'] = ['vtt']
     new_query = urlencode(qs, doseq=True)
     new_url = urlunparse(parsed._replace(query=new_query))
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    }
+    headers = {'User-Agent': _UA}
 
     for attempt in range(max_retries):
         _pace_translate_requests()
@@ -334,75 +418,100 @@ def _fetch_translated_caption_text(base_url, tlang='en', max_retries=5):
             with urllib.request.urlopen(req, timeout=15) as resp:
                 raw = resp.read().decode('utf-8', errors='replace')
             if not raw.strip():
-                raise ValueError("YouTube returned an empty translated caption track.")
+                raise SubtitleError('no_subs', "YouTube returned an empty translated caption track.")
             return raw
         except urllib.error.HTTPError as e:
             if e.code == 429:
                 if attempt < max_retries - 1:
-                    backoff = min(2 ** attempt * 3, 45)
-                    time.sleep(backoff)
+                    time.sleep(min(2 ** attempt * 3, 45))
                     continue
-                raise ValueError(
+                raise SubtitleError(
+                    'blocked',
                     "YouTube rate-limited the translation requests (HTTP 429) after several "
                     "retries. Try again in a few minutes, or download fewer videos at once."
                 )
-            raise ValueError(f"HTTP {e.code} fetching translated captions: {e.reason}")
-    raise ValueError("Failed to fetch translated captions after multiple retries.")
+            raise SubtitleError('blocked' if e.code in (403,) else 'other',
+                                f"HTTP {e.code} fetching translated captions: {e.reason}")
+    raise SubtitleError('other', "Failed to fetch translated captions after multiple retries.")
 
-def get_subtitles_yt_dlp(video_url, format_choice, cookies_file, temp_dir, mode='original'):
+
+# ─── yt-dlp path ─────────────────────────────────────────────────────────────
+
+# Player clients that can use cookies to get past age-gates. Unknown client names
+# are simply skipped (with a warning) by yt-dlp, so this is safe across versions.
+_AGE_GATE_CLIENTS = ['tv', 'web_creator', 'mweb']
+
+def _ydl_opts(cookiefile, clients=None, **extra):
+    opts = {'quiet': True, 'no_warnings': True, 'cookiefile': cookiefile}
+    if clients:
+        opts['extractor_args'] = {'youtube': {'player_client': clients}}
+    opts.update(extra)
+    return opts
+
+def _extract_info_resilient(video_url, cookiefile):
+    """Extract video info. If YouTube demands sign-in / age confirmation and cookies
+    are available, retry with player clients that accept cookies for age-gated
+    videos. Returns (info, clients_used)."""
+    attempts = [None]
+    if cookiefile:
+        attempts.append(_AGE_GATE_CLIENTS)
+
+    last_exc = None
+    for clients in attempts:
+        try:
+            with YoutubeDL(_ydl_opts(cookiefile, clients, skip_download=True)) as ydl:
+                info = ydl.extract_info(video_url, download=False)
+            if info:
+                return info, clients
+            last_exc = SubtitleError('unavailable',
+                                     "yt-dlp could not extract video info (private, deleted, or blocked).")
+        except Exception as e:
+            last_exc = e
+            if classify_error(e) not in ('age', 'blocked'):
+                raise
+    raise last_exc
+
+def _get_subtitles_yt_dlp_impl(video_url, format_choice, cookiefile, work_dir, mode):
     dl_format = 'srt' if format_choice == 'txt' else format_choice
-    base_opts = {
-        'writesubtitles': True,
-        'writeautomaticsub': True,
-        'skip_download': True,
-        'outtmpl': os.path.join(temp_dir, '%(title)s.%(ext)s'),
-        'quiet': True,
-        'no_warnings': True,
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'cookiefile': cookies_file,
-        'restrict_filenames': True,
-        'ignoreerrors': True,
-    }
 
     _pace_youtube_request()
-    probe_opts = {'quiet': True, 'no_warnings': True, 'cookiefile': cookies_file, 'skip_download': True}
-    with YoutubeDL(probe_opts) as ydl:
-        info = ydl.extract_info(video_url, download=False)
-    if info is None:
-        raise ValueError("yt-dlp could not extract video info (video may be private, deleted, or blocked).")
+    info, clients = _extract_info_resilient(video_url, cookiefile)
     manual = info.get('subtitles') or {}
     auto = info.get('automatic_captions') or {}
 
+    base_opts = _ydl_opts(
+        cookiefile, clients,
+        writesubtitles=True, writeautomaticsub=True, skip_download=True,
+        outtmpl=os.path.join(work_dir, '%(id)s.%(ext)s'),
+        user_agent=_UA, restrict_filenames=True, ignoreerrors=True,
+    )
+
     def _download_lang(lang_code):
         _pace_youtube_request()
-        ydl_opts = {**base_opts, 'subtitleslangs': [lang_code], 'automaticsubslangs': [lang_code],
-                    'subtitlesformat': f'{dl_format}/vtt/srv3/srv1/best'}
-        with YoutubeDL(ydl_opts) as ydl:
+        opts = {**base_opts, 'subtitleslangs': [lang_code], 'automaticsubslangs': [lang_code],
+                'subtitlesformat': f'{dl_format}/vtt/srv3/srv1/best'}
+        with YoutubeDL(opts) as ydl:
             ydl.download([video_url])
         found = []
         for ext in [dl_format, 'vtt', 'ttml', 'srv3', 'srv2', 'srv1', 'json3']:
-            found += glob.glob(os.path.join(temp_dir, f'*.{lang_code}.{ext}'))
+            found += glob.glob(os.path.join(work_dir, f'*.{lang_code}.{ext}'))
         return found
 
+    def _read_and_remove(path):
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            text = f.read()
+        os.remove(path)
+        if path.endswith('.vtt') and format_choice == 'srt':
+            text = vtt_to_srt(text)
+        return text
+
     if mode == 'en_translation':
-        # 1) If yt-dlp already lists a ready-made 'en' track (native or pre-listed
-        #    translation), just grab it - this is the cheap, reliable path.
         if 'en' in manual or 'en' in auto:
             files = _download_lang('en')
             if files:
-                sub_path = files[0]
-                with open(sub_path, 'r', encoding='utf-8') as f:
-                    sub_text = f.read()
-                os.remove(sub_path)
-                if sub_path.endswith('.vtt') and format_choice != 'txt' and format_choice == 'srt':
-                    sub_text = vtt_to_srt(sub_text)
-                is_auto = 'en' not in manual
-                return sub_text, 'en', is_auto
+                return _read_and_remove(files[0]), 'en', ('en' not in manual)
 
-        # 2) yt-dlp didn't surface an 'en' key - fall back to manually requesting
-        #    YouTube's translate-on-demand (tlang=en) on whatever auto-caption track
-        #    does exist. This is what actually gets you the "auto-translate to English"
-        #    option you see in the YouTube web player, even when yt-dlp doesn't list it.
+        # Fall back to YouTube's translate-on-demand (tlang=en) on an existing auto track.
         if auto:
             base_lang = next(iter(auto.keys()))
             track_list = auto[base_lang]
@@ -414,39 +523,44 @@ def get_subtitles_yt_dlp(video_url, format_choice, cookies_file, temp_dir, mode=
                 sub_text = vtt_to_srt(vtt_text) if format_choice == 'srt' else vtt_text
                 return sub_text, 'en', True
 
-        raise ValueError("No English transcript or translatable auto-caption track found for this video.")
+        raise SubtitleError('no_subs',
+                            "No English transcript or translatable auto-caption track found for this video.")
 
-    else:  # 'original'
-        native_lang = info.get('language')
-        lang_code = None
-        if native_lang and (native_lang in manual or native_lang in auto):
-            lang_code = native_lang
-        elif manual:
-            lang_code = next(iter(manual.keys()))
-        elif auto:
-            lang_code = next(iter(auto.keys()))
+    # mode == 'original'
+    native_lang = info.get('language')
+    lang_code = None
+    if native_lang and (native_lang in manual or native_lang in auto):
+        lang_code = native_lang
+    elif manual:
+        lang_code = next(iter(manual.keys()))
+    elif auto:
+        lang_code = next(iter(auto.keys()))
 
-        if not lang_code:
-            raise ValueError(
-                "No subtitles found (captions may not be generated yet for a very "
-                "recently uploaded video — YouTube's auto-caption pipeline can take "
-                "minutes to over a day)."
-            )
+    if not lang_code:
+        raise SubtitleError(
+            'no_subs',
+            "No subtitles found (captions may not be generated yet for a very "
+            "recently uploaded video — YouTube's auto-caption pipeline can take "
+            "minutes to over a day)."
+        )
 
-        files = _download_lang(lang_code)
-        if not files:
-            raise ValueError("No subtitles found")
+    files = _download_lang(lang_code)
+    if not files:
+        raise SubtitleError('no_subs', "No subtitles found (yt-dlp downloaded nothing).")
 
-        sub_path = files[0]
-        with open(sub_path, 'r', encoding='utf-8') as f:
-            sub_text = f.read()
-        os.remove(sub_path)
-        if sub_path.endswith('.vtt') and format_choice == 'srt':
-            sub_text = vtt_to_srt(sub_text)
-        is_auto = lang_code not in manual
-        return sub_text, lang_code, is_auto
+    return _read_and_remove(files[0]), lang_code, (lang_code not in manual)
+
+def get_subtitles_yt_dlp(video_url, format_choice, cookies_file, temp_dir, mode='original'):
+    """Always raises SubtitleError on failure. Uses a private cookie copy and a
+    private work folder so concurrent calls can't interfere with each other."""
+    try:
+        with _cookie_copy(cookies_file) as ck, tempfile.TemporaryDirectory(dir=temp_dir) as work_dir:
+            return _get_subtitles_yt_dlp_impl(video_url, format_choice, ck, work_dir, mode)
+    except Exception as e:
+        raise _wrap_exc(e)
 
 
+# ─── Listing / searching ─────────────────────────────────────────────────────
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def get_info(url, is_playlist=False, cookies_file=None):
@@ -456,13 +570,12 @@ def get_info(url, is_playlist=False, cookies_file=None):
             'extract_flat': True,
             'quiet': True,
             'no_warnings': True,
-            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'user_agent': _UA,
             'cookiefile': cookies_file,
         }
         with YoutubeDL(ydl_opts) as ydl:
             result = ydl.extract_info(url, download=False)
             entries = result.get('entries', [])
-            # Channels can return nested entries (tabs → videos)
             if entries and isinstance(entries[0], dict) and 'entries' in entries[0]:
                 entries = entries[0].get('entries', [])
             video_ids = [e.get('id') for e in entries if e and e.get('id')]
@@ -480,9 +593,6 @@ def get_info(url, is_playlist=False, cookies_file=None):
         return [(video_id, title)], title
 
 
-# sp= values are YouTube's own search "Sort by" filter parameters (captured
-# from the live results?...&sp=... URL). None means "let ytsearch use YouTube's
-# default relevance ranking" rather than building a filtered results URL.
 _SEARCH_SORT_SP = {
     'relevance': None,
     'most_viewed': 'CAMSAhAB',  # Sort by: View count (all-time)
@@ -491,16 +601,7 @@ _SEARCH_SORT_SP = {
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def get_search_info(query, max_results, cookies_file=None, sort_mode='relevance'):
-    """Search YouTube for `query` and return the top `max_results` videos as
-    a list of (video_id, title) tuples.
-
-    sort_mode:
-      'relevance'   -> YouTube's default relevance ranking (yt-dlp's ytsearchN: prefix)
-      'most_viewed' -> sorted by all-time view count. This is the closest real
-                        equivalent to "trending for this keyword" — YouTube has
-                        no trending feed that can be scoped to a search term.
-      'newest'      -> sorted by upload date, newest first
-    """
+    """Search YouTube and return the top `max_results` videos as (video_id, title)."""
     max_results = max(1, min(int(max_results), 500))
     sp_value = _SEARCH_SORT_SP.get(sort_mode)
 
@@ -509,17 +610,13 @@ def get_search_info(query, max_results, cookies_file=None, sort_mode='relevance'
         'extract_flat': True,
         'quiet': True,
         'no_warnings': True,
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'user_agent': _UA,
         'cookiefile': cookies_file,
     }
 
     if sp_value is None:
-        # Plain relevance search: yt-dlp's dedicated search extractor paginates
-        # on its own until it has N results.
         search_target = f"ytsearch{max_results}:{query}"
     else:
-        # Sorted search: hit a real youtube.com/results URL carrying YouTube's
-        # own 'sp' sort filter, and cap how many entries get pulled from it.
         params = urlencode({'search_query': query, 'sp': sp_value})
         search_target = f"https://www.youtube.com/results?{params}"
         ydl_opts['playlistend'] = max_results
@@ -532,6 +629,8 @@ def get_search_info(query, max_results, cookies_file=None, sort_mode='relevance'
         titles = [e.get('title', f'video_{i+1}') for i, e in enumerate(entries)]
         return list(zip(video_ids, titles))
 
+
+# ─── Text processing / output ────────────────────────────────────────────────
 
 def convert_srt_to_txt(srt_text):
     lines = srt_text.split('\n')
@@ -586,54 +685,6 @@ def create_zip(subtitle_files, title, format_choice):
     zip_buffer.seek(0)
     return zip_buffer, f"{safe_title}_subtitles.zip"
 
-@retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=1, max=10))
-def download_subtitles(url, format_choice, temp_dir, is_playlist, progress_bar, total_videos,
-                       clean_transcript, cookies_file=None, sub_mode='original'):
-    subtitle_files = []
-    entries, title = get_info(url, is_playlist, cookies_file)
-    if not entries:
-        st.error("No videos found.")
-        return temp_dir, title, subtitle_files
-
-    for i, (video_id, video_title) in enumerate(entries):
-        video_url = f"https://www.youtube.com/watch?v={video_id}"
-        try:
-            try:
-                sub_text, lang_code, is_auto = get_transcript_api(video_id, format_choice, sub_mode)
-                fallback_used = False
-            except Exception as api_exc:
-                try:
-                    sub_text, lang_code, is_auto = get_subtitles_yt_dlp(
-                        video_url, format_choice, cookies_file, temp_dir, sub_mode)
-                    fallback_used = True
-                    if not cookies_file:
-                        st.info(f"Used yt-dlp fallback for '{video_title}' (API said: {api_exc})")
-                except Exception as dlp_exc:
-                    raise ValueError(f"API failed ({api_exc}); yt-dlp fallback also failed ({dlp_exc})")
-
-            if clean_transcript:
-                sub_text = clean_subtitle_text(sub_text)
-            if format_choice == 'txt':
-                sub_text = convert_srt_to_txt(sub_text)
-
-            subtitle_files.append((video_title, sub_text))
-            lang_name = format_language_option(lang_code)
-            auto_note = ' (Auto-generated)' if is_auto else ''
-            source_note = ' (via yt-dlp)' if fallback_used else ''
-            st.info(f"✓ '{video_title}' — {lang_name}{auto_note}{source_note}")
-        except ValueError as ve:
-            error_msg = str(ve).lower()
-            if "age-restricted" in error_msg or "access denied" in error_msg:
-                st.warning(f"'{video_title}' is age-restricted. Upload cookies to access.")
-            else:
-                st.warning(f"No subs for '{video_title}': {str(ve)}")
-        except Exception as e:
-            st.warning(f"Error for '{video_title}': {type(e).__name__}: {str(e)}")
-
-        progress_bar.progress((i + 1) / total_videos)
-
-    return temp_dir, title, subtitle_files
-
 def get_mime_type(format_choice):
     return {'srt': 'text/plain', 'vtt': 'text/vtt', 'txt': 'text/plain'}.get(format_choice, 'text/plain')
 
@@ -646,16 +697,16 @@ def get_multi_video_info(video_url, cookies_file=None):
     if not video_id:
         raise ValueError(f"Could not extract video ID from: {video_url}")
     _pace_youtube_request()
-    ydl_opts = {'quiet': True, 'no_warnings': True, 'cookiefile': cookies_file}
-    with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(video_url, download=False)
-        title = info.get('title', 'Unknown Title')
-        channel = info.get('channel', info.get('uploader', 'Unknown Channel'))
+    with _cookie_copy(cookies_file) as ck:
+        ydl_opts = {'quiet': True, 'no_warnings': True, 'cookiefile': ck}
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+            title = info.get('title', 'Unknown Title')
+            channel = info.get('channel', info.get('uploader', 'Unknown Channel'))
     return video_id, title, channel
 
 
 def prepend_video_header(sub_text, video_title, channel_name):
-    """Prepend video title and channel name as a header for txt format."""
     header = (
         f"Video: {video_title}\n"
         f"Channel: {channel_name}\n"
@@ -665,28 +716,29 @@ def prepend_video_header(sub_text, video_title, channel_name):
 
 
 def _try_fetch_subs(video_id, video_url_item, format_choice, sub_mode, cookies_file, temp_dir):
-    """Shared try-API-then-yt-dlp logic with real error messages surfaced,
-    used by every download mode below."""
+    """Try the transcript API first, then yt-dlp. On total failure raises a
+    SubtitleError whose `kind` reflects the REAL cause."""
     try:
         sub_text, lang_code, is_auto = get_transcript_api(video_id, format_choice, sub_mode)
-        return sub_text, lang_code, is_auto, False, None
-    except Exception as api_exc:
+        return sub_text, lang_code, is_auto, False
+    except SubtitleError as api_exc:
+        if api_exc.kind == 'disabled':
+            raise  # uploader turned subtitles off; yt-dlp can't change that
         try:
             sub_text, lang_code, is_auto = get_subtitles_yt_dlp(
                 video_url_item, format_choice, cookies_file, temp_dir, sub_mode)
-            return sub_text, lang_code, is_auto, True, api_exc
-        except Exception as dlp_exc:
-            raise ValueError(f"API: {api_exc} | yt-dlp: {dlp_exc}")
+            return sub_text, lang_code, is_auto, True
+        except SubtitleError as dlp_exc:
+            raise _merge_errors(api_exc, dlp_exc)
 
 
 def _fetch_one_video(video_id, video_title, video_url, format_choice, sub_mode,
                       cookies_file, temp_dir, clean_transcript, header_info=None):
-    """Worker for one video — runs inside a background thread, so it must
-    never call any st.* function. Returns a plain dict describing the outcome;
-    the caller reports it to the UI afterward, in the main thread."""
+    """Worker for one video — runs in a background thread, so it must never call
+    any st.* function. Returns a plain dict describing the outcome."""
     try:
         with _YT_SEMAPHORE:
-            sub_text, lang_code, is_auto, fallback_used, _api_exc = _try_fetch_subs(
+            sub_text, lang_code, is_auto, fallback_used = _try_fetch_subs(
                 video_id, video_url, format_choice, sub_mode, cookies_file, temp_dir)
 
         if clean_transcript:
@@ -700,23 +752,18 @@ def _fetch_one_video(video_id, video_title, video_url, format_choice, sub_mode,
             'ok': True, 'title': video_title, 'sub_text': sub_text,
             'lang_code': lang_code, 'is_auto': is_auto, 'fallback_used': fallback_used,
         }
-    except ValueError as ve:
-        return {'ok': False, 'title': video_title, 'error': str(ve)}
+    except SubtitleError as se:
+        return {'ok': False, 'title': video_title, 'error': str(se), 'kind': se.kind}
     except Exception as e:
-        return {'ok': False, 'title': video_title, 'error': f"{type(e).__name__}: {e}"}
+        return {'ok': False, 'title': video_title,
+                'error': f"{type(e).__name__}: {_short(e)}", 'kind': classify_error(e)}
 
 
 def _download_many(entries, format_choice, sub_mode, cookies_file, temp_dir,
                     clean_transcript, progress_bar, header_lookup=None,
                     max_workers=_MAX_CONCURRENT_REQUESTS):
     """Fetch subtitles for a list of (video_id, video_title) tuples concurrently.
-    This is the main speedup: videos are downloaded several at a time instead
-    of strictly one after another. Results are returned in the SAME order as
-    `entries` (not completion order), so callers can report them predictably.
-
-    `header_lookup(video_id)` -> (title, channel) or None, used to prepend
-    txt headers in multi-video mode without an extra sequential round trip.
-    """
+    Results are returned in the SAME order as `entries`."""
     total = len(entries)
     results = [None] * total
 
@@ -732,23 +779,23 @@ def _download_many(entries, format_choice, sub_mode, cookies_file, temp_dir,
             future_to_idx[fut] = i
 
         done = 0
-        # as_completed() runs in THIS (main) thread, so progress_bar updates here are safe —
-        # only the actual network work happens in the background workers.
         for fut in concurrent.futures.as_completed(future_to_idx):
             idx = future_to_idx[fut]
             try:
                 results[idx] = fut.result()
             except Exception as e:
-                results[idx] = {'ok': False, 'title': entries[idx][1], 'error': f"{type(e).__name__}: {e}"}
+                results[idx] = {'ok': False, 'title': entries[idx][1],
+                                'error': f"{type(e).__name__}: {_short(e)}", 'kind': classify_error(e)}
             done += 1
             progress_bar.progress(done / total)
 
     return results
 
 
-def _report_results(results):
-    """Print the st.info/st.warning lines for a batch of _download_many results,
-    in original order, and return the list of (title, sub_text) for successes."""
+def _report_results(results, cookies_file=None):
+    """Print st.info/st.warning lines for a batch of results, in original order,
+    and return the list of (title, sub_text) for successes. The message is chosen
+    from the REAL error kind, not by string-matching."""
     subtitle_files = []
     for r in results:
         if r['ok']:
@@ -757,12 +804,35 @@ def _report_results(results):
             auto_note = ' (Auto-generated)' if r['is_auto'] else ''
             source_note = ' (via yt-dlp)' if r['fallback_used'] else ''
             st.info(f"✓ '{r['title']}' — {lang_name}{auto_note}{source_note}")
-        else:
-            msg = r['error'].lower()
-            if "age-restricted" in msg or "access denied" in msg:
-                st.warning(f"⚠️ '{r['title']}' is age-restricted. Upload cookies to access.")
+            continue
+
+        title, kind, detail = r['title'], r.get('kind', 'other'), r['error']
+        if kind == 'age':
+            if cookies_file:
+                st.warning(
+                    f"⚠️ '{title}' is age-restricted and YouTube still refused your cookies. "
+                    "They are probably expired or not from a logged-in, age-verified account. "
+                    "Re-export them from a private/incognito window (log in, open the video, "
+                    "export cookies.txt, close the window) and upload again.\n\n"
+                    f"Details: {detail}"
+                )
             else:
-                st.warning(f"⚠️ No subs for '{r['title']}': {r['error']}")
+                st.warning(f"⚠️ '{title}' is age-restricted. Upload cookies.txt from a logged-in, "
+                           "age-verified account to access it.")
+        elif kind == 'blocked':
+            hint = ("Wait a few minutes, lower the number of videos, or try from a different "
+                    "network (cloud/VPN IPs are often blocked).")
+            if not cookies_file:
+                hint += " Uploading cookies can also help with YouTube's bot check."
+            st.warning(f"⚠️ '{title}': YouTube is blocking/rate-limiting requests. {hint}\n\nDetails: {detail}")
+        elif kind == 'disabled':
+            st.warning(f"⚠️ '{title}': the uploader has disabled subtitles for this video.")
+        elif kind == 'unavailable':
+            st.warning(f"⚠️ '{title}': video is private, removed, or unavailable.\n\nDetails: {detail}")
+        elif kind == 'no_subs':
+            st.warning(f"⚠️ No subs for '{title}': {detail}")
+        else:
+            st.warning(f"⚠️ Error for '{title}': {detail}")
     return subtitle_files
 
 
@@ -774,9 +844,6 @@ def main():
     st.title("🎥 YouTube Subtitle Downloader")
     st.caption("Download subtitles from YouTube videos, playlists, and channels.")
 
-    # =========================================================================
-    # Mode selection — single source of truth (no separate tabs + radio)
-    # =========================================================================
     mode_options = ["Playlist / Channel", "Single / Multi-Video", "Channel + Keyword", "Keyword Search"]
     if "download_mode" not in st.session_state:
         st.session_state.download_mode = mode_options[0]
@@ -948,7 +1015,7 @@ def main():
         )
 
     # =========================================================================
-    # Shared settings — laid out as horizontal radio bars in the main area
+    # Shared settings
     # =========================================================================
     with st.expander("⚙️ Shared Settings (format, language, cookies)", expanded=True):
         col_a, col_b = st.columns(2)
@@ -968,16 +1035,30 @@ def main():
 
         st.markdown("---")
         st.markdown(
-            "**For Age-Restricted Videos**: Upload cookies to bypass blocks.\n"
-            "1. Use the \"Get cookies.txt LOCALLY\" browser extension.\n"
-            "2. Log in to YouTube, visit the video.\n"
-            "3. Export as `cookies.txt` and upload below."
+            "**For Age-Restricted Videos**: upload cookies from a **logged-in, age-verified** account.\n"
+            "1. Open a **private/incognito** window and log in to YouTube.\n"
+            "2. Open any age-restricted video once (so the age check passes).\n"
+            "3. With the \"Get cookies.txt LOCALLY\" extension, export `cookies.txt` for youtube.com.\n"
+            "4. **Close the private window**, then upload the file below "
+            "(YouTube invalidates cookies of sessions you keep open)."
         )
         uploaded_file = st.file_uploader("Upload Cookies (Optional)", type=["txt"], key="cookies_upload")
         cookies_file = None
         if uploaded_file:
+            cookie_bytes = uploaded_file.getvalue()
+            header_ok, n_yt, has_login = inspect_cookies(cookie_bytes)
+            if not header_ok:
+                st.warning("⚠️ File doesn't start with the Netscape cookie header "
+                           "(`# Netscape HTTP Cookie File`). Re-export it as Netscape-format cookies.txt.")
+            if n_yt == 0:
+                st.error("❌ No youtube.com cookies found in this file — it can't unlock age-restricted videos.")
+            elif not has_login:
+                st.warning("⚠️ youtube.com cookies found, but no login cookies (SID / __Secure-3PSID / LOGIN_INFO). "
+                           "You were probably not logged in when exporting, so age-restricted videos will still fail.")
+            else:
+                st.success(f"✅ Cookies look valid ({n_yt} youtube.com cookies, login cookies present).")
             with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as tmp:
-                tmp.write(uploaded_file.read())
+                tmp.write(cookie_bytes)
                 cookies_file = tmp.name
 
     # =========================================================================
@@ -1017,7 +1098,7 @@ def main():
             with tempfile.TemporaryDirectory() as temp_dir:
                 results = _download_many(entries, format_choice, sub_mode, cookies_file,
                                          temp_dir, clean_transcript, progress_bar)
-                subtitle_files = _report_results(results)
+                subtitle_files = _report_results(results, cookies_file)
 
                 if not subtitle_files:
                     st.error("Nothing was downloaded.")
@@ -1091,7 +1172,7 @@ def main():
                         filtered_entries.append((vid, title))
 
             if not filtered_entries:
-                st.error(f"None of the keyword(s) matched any videos on this channel.")
+                st.error("None of the keyword(s) matched any videos on this channel.")
                 return
 
             total_videos = len(filtered_entries)
@@ -1102,7 +1183,7 @@ def main():
             with tempfile.TemporaryDirectory() as temp_dir:
                 results = _download_many(filtered_entries, format_choice, sub_mode, cookies_file,
                                          temp_dir, clean_transcript, progress_bar)
-                subtitle_files = _report_results(results)
+                subtitle_files = _report_results(results, cookies_file)
 
                 if not subtitle_files:
                     st.error("Nothing was downloaded.")
@@ -1132,7 +1213,6 @@ def main():
                 st.error("Please enter at least one video URL.")
                 return
 
-            # Validate that every URL is a single video (no playlists/channels)
             valid_video_urls = []
             for raw in raw_urls:
                 try:
@@ -1153,9 +1233,6 @@ def main():
             progress_bar = st.progress(0.0)
 
             with tempfile.TemporaryDirectory() as temp_dir:
-                # Fetch title + channel metadata for all videos concurrently first
-                # (only needed for txt headers / nicer filenames), instead of one
-                # blocking round trip per video before its subtitles can even start.
                 video_ids = [extract_video_id(u) for u in valid_video_urls]
                 meta = {}  # video_id -> (title, channel)
 
@@ -1177,17 +1254,16 @@ def main():
                 results = _download_many(entries, format_choice, sub_mode, cookies_file,
                                          temp_dir, clean_transcript, progress_bar,
                                          header_lookup=header_lookup)
-                subtitle_files = _report_results(results)
+                subtitle_files = _report_results(results, cookies_file)
 
                 if not subtitle_files:
-                    st.error("Nothing was downloaded. Try different URLs or upload cookies.")
+                    st.error("Nothing was downloaded. See the messages above for the exact reason per video.")
                     return
 
                 st.success(f"Done! Got subtitles for {len(subtitle_files)}/{total_videos} video(s).")
                 mime_type = get_mime_type(format_choice)
 
                 if total_videos == 1 and subtitle_files:
-                    # Single video — always just one file
                     _, sub_text = subtitle_files[0]
                     fname = f"{sanitize_filename(subtitle_files[0][0])[:150]}.{format_choice}"
                     st.download_button("📄 Download Subtitle File",
@@ -1205,7 +1281,7 @@ def main():
                 os.unlink(cookies_file)
             return
 
-        # ── Single / Playlist / Channel mode (unchanged) ──────────────────────
+        # ── Single / Playlist / Channel mode ──────────────────────────────────
         if not url:
             st.error("Please enter a URL.")
             return
@@ -1276,10 +1352,10 @@ def main():
             try:
                 results = _download_many(entries, format_choice, sub_mode, cookies_file,
                                          temp_dir, clean_transcript, progress_bar)
-                subtitle_files = _report_results(results)
+                subtitle_files = _report_results(results, cookies_file)
 
                 if not subtitle_files:
-                    st.error("Nothing was downloaded. Try a different URL or upload cookies.")
+                    st.error("Nothing was downloaded. See the messages above for the exact reason per video.")
                     return
 
                 st.success(f"Done! Got subtitles for {len(subtitle_files)}/{total_videos} video(s).")
@@ -1294,7 +1370,6 @@ def main():
                     else:
                         zip_buffer, zip_name = create_zip(subtitle_files, playlist_title, format_choice)
                         st.download_button("📦 Download ZIP", zip_buffer, zip_name, "application/zip")
-
                 else:
                     if subtitle_files:
                         _, sub_text = subtitle_files[0]

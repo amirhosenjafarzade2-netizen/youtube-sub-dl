@@ -126,6 +126,8 @@ def _short(exc, limit=300):
 def classify_error(exc):
     name = type(exc).__name__
     msg = str(exc).lower()
+    if ('requested format is not available' in msg or 'no formats found' in msg or 'no video formats found' in msg):
+        return 'format_unavailable'
     if name == 'AgeRestricted' or any(p in msg for p in _AGE_PHRASES):
         return 'age'
     if name in ('IpBlocked', 'RequestBlocked') or any(p in msg for p in _BOT_PHRASES):
@@ -146,12 +148,16 @@ def _wrap_exc(exc):
 
 def _merge_errors(api_exc, dlp_exc):
     """Decide the single most truthful kind when BOTH the API and yt-dlp failed."""
-    if dlp_exc.kind in ('no_subs', 'disabled', 'unavailable'):
+    if dlp_exc.kind in ('no_subs', 'disabled', 'unavailable', 'format_unavailable'):
         kind = dlp_exc.kind
     elif 'age' in (api_exc.kind, dlp_exc.kind):
         kind = 'age'
     elif dlp_exc.kind != 'other':
         kind = dlp_exc.kind
+    elif api_exc.kind == 'blocked':
+        # Keep the IP-block context in the details, but don't mislabel a separate
+        # yt-dlp format error as proof that the IP itself is blocked.
+        kind = 'other'
     else:
         kind = api_exc.kind
     return SubtitleError(kind, f"API: {api_exc} | yt-dlp: {dlp_exc}")
@@ -447,7 +453,7 @@ def _fetch_translated_caption_text(base_url, tlang='en', max_retries=5):
 # ─── yt-dlp path ─────────────────────────────────────────────────────────────
 
 def _ydl_opts(cookiefile, clients=None, **extra):
-    opts = {'quiet': True, 'no_warnings': True, 'cookiefile': cookiefile}
+    opts = {'quiet': True, 'no_warnings': True, 'cookiefile': cookiefile, 'ignore_no_formats_error': True, 'skip_download': True}
     if clients:
         opts['extractor_args'] = {'youtube': {'player_client': clients}}
     if _PROXY[0]:
@@ -537,7 +543,7 @@ def _fetch_track_text(ydl, url, max_retries=4):
 def _get_subtitles_yt_dlp_impl(video_url, format_choice, cookiefile, mode):
     # Different player clients expose different (and differently-protected) caption
     # URLs. Try several; unknown client names are skipped by yt-dlp.
-    attempts = [None, ['tv'], ['web_safari'], ['mweb']]
+    attempts = [None, ['tv'], ['web_safari'], ['mweb'], ['ios'], ['android_vr']]
     if cookiefile:
         attempts += [['web_creator'], ['tv', 'web_creator', 'mweb']]
 
@@ -546,7 +552,7 @@ def _get_subtitles_yt_dlp_impl(video_url, format_choice, cookiefile, mode):
     for clients in attempts:
         try:
             _pace_youtube_request()
-            with YoutubeDL(_ydl_opts(cookiefile, clients, skip_download=True, user_agent=_UA)) as ydl:
+            with YoutubeDL(_ydl_opts(cookiefile, clients, skip_download=True, ignore_no_formats_error=True, user_agent=_UA)) as ydl:
                 info = ydl.extract_info(video_url, download=False)
                 if not info:
                     raise SubtitleError('unavailable',
@@ -845,6 +851,13 @@ def _report_results(results, cookies_file=None):
             st.warning(f"⚠️ '{title}': video is private, removed, or unavailable.\n\nDetails: {detail}")
         elif kind == 'no_subs':
             st.warning(f"⚠️ No subs for '{title}': {detail}")
+        elif kind == 'format_unavailable':
+            st.warning(
+                f"⚠️ '{title}': yt-dlp could not find a usable media format, but this app only "
+                "needs captions. The app retries caption extraction with format-independent "
+                "metadata handling and alternate YouTube player clients. If it still fails, "
+                "update yt-dlp and try again. Details: " + detail
+            )
         else:
             st.warning(f"⚠️ Error for '{title}': {detail}")
     return subtitle_files

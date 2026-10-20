@@ -1,27 +1,32 @@
 """
 YouTube Subtitle Downloader — Streamlit app
 
-Changes in this version (RequestBlocked / "yt-dlp downloaded nothing" fixes):
-  1. yt-dlp is now used only to READ video info. The caption URL is then fetched
-     directly (with retry/backoff on HTTP 429) instead of ydl.download() with
-     ignoreerrors=True, which swallowed the real error and produced the useless
-     "yt-dlp downloaded nothing" message.
-  2. yt-dlp is tried with several player clients (default, tv, web_safari, mweb,
-     plus cookie-only clients) because some clients return caption URLs that
-     YouTube refuses to serve.
-  3. After one RequestBlocked from youtube_transcript_api, the API is skipped
-     for a few minutes so the rest of the batch goes straight to yt-dlp.
-  4. Default parallelism lowered to 2 (slider up to 5). Optional proxy support
-     for both the API and yt-dlp.
-  5. Original-language pick prefers yt-dlp's "<lang>-orig" auto track instead of
-     the first (possibly machine-translated) language in the list.
-  6. Rolling duplicate lines in YouTube auto-captions are removed in srt/txt.
+Changes in this version (misleading "No subs" fixes):
+  1. yt-dlp now tries EVERY player client (default, tv, web_safari, mweb, ios,
+     android_vr, + cookie-only clients). Before, it gave up after 2 clients
+     returned no tracks, so it never reached the clients that expose captions.
+  2. yt-dlp warnings (e.g. missing PO token, sign-in required) are captured and
+     shown in the error instead of being silenced by no_warnings=True.
+  3. If the transcript API is IP-blocked AND yt-dlp finds no tracks, the result
+     is labelled "blocked" (unknown), not "no subs" — we can't confirm either way.
+  4. Earlier fixes kept: yt-dlp only reads info and the caption URL is fetched
+     with 429 backoff; API skipped for a few minutes after RequestBlocked;
+     parallelism default 2; optional proxy; "<lang>-orig" preferred for the
+     original language; rolling duplicate lines removed in srt/txt.
 
 IMPORTANT — do this first:
-    pip install -U youtube-transcript-api yt-dlp
+    pip install -U youtube-transcript-api yt-dlp bgutil-ytdlp-pot-provider
 
-If your IP is blocked (cloud hosts / VPNs / too many requests), use the Proxy
-field (a residential proxy works best) or run the app from your home network.
+  * bgutil-ytdlp-pot-provider supplies PO tokens, which YouTube now requires for
+    captions on web-type clients. Without it captions often appear "missing".
+  * Upload cookies.txt (logged-in account) — the single biggest fix for both the
+    IP block and hidden captions.
+  * If your IP is blocked (cloud hosts / VPNs / too many requests), use the Proxy
+    field (residential works best), set Parallel downloads to 1, or run from
+    your home network.
+
+Sanity check from a terminal:
+    yt-dlp --list-subs --cookies cookies.txt "https://www.youtube.com/watch?v=VIDEO_ID"
 """
 
 import streamlit as st
@@ -137,7 +142,7 @@ def classify_error(exc):
     if name in ('VideoUnavailable', 'VideoUnplayable', 'InvalidVideoId') or any(p in msg for p in _UNAVAILABLE_PHRASES):
         return 'unavailable'
     if name in ('NoTranscriptFound', 'NotTranslatable', 'TranslationLanguageNotAvailable') \
-            or 'no subtitles' in msg or 'no transcript' in msg:
+            or 'no subtitles' in msg or 'no transcript' in msg or 'no caption tracks' in msg:
         return 'no_subs'
     return 'other'
 
@@ -148,6 +153,13 @@ def _wrap_exc(exc):
 
 def _merge_errors(api_exc, dlp_exc):
     """Decide the single most truthful kind when BOTH the API and yt-dlp failed."""
+    # API blocked + yt-dlp found nothing: we can't tell "no captions" from "hidden
+    # by YouTube". Report it as blocked/unknown, never as a definite "no subs".
+    if api_exc.kind == 'blocked' and dlp_exc.kind == 'no_subs':
+        return SubtitleError(
+            'blocked',
+            "Transcript API is IP-blocked and yt-dlp returned no caption tracks, so it can't be "
+            f"confirmed either way. API: {api_exc} | yt-dlp: {dlp_exc}")
     if dlp_exc.kind in ('no_subs', 'disabled', 'unavailable', 'format_unavailable'):
         kind = dlp_exc.kind
     elif 'age' in (api_exc.kind, dlp_exc.kind):
@@ -452,6 +464,16 @@ def _fetch_translated_caption_text(base_url, tlang='en', max_retries=5):
 
 # ─── yt-dlp path ─────────────────────────────────────────────────────────────
 
+class _YDLLog:
+    """Collect yt-dlp warnings/errors (PO token missing, sign-in required, ...)
+    instead of silencing them, so the final error can say what really happened."""
+    def __init__(self):
+        self.msgs = []
+    def debug(self, m): pass
+    def info(self, m): pass
+    def warning(self, m): self.msgs.append(_short(m, 200))
+    def error(self, m): self.msgs.append(_short(m, 200))
+
 def _ydl_opts(cookiefile, clients=None, **extra):
     opts = {'quiet': True, 'no_warnings': True, 'cookiefile': cookiefile, 'ignore_no_formats_error': True, 'skip_download': True}
     if clients:
@@ -542,27 +564,26 @@ def _fetch_track_text(ydl, url, max_retries=4):
 
 def _get_subtitles_yt_dlp_impl(video_url, format_choice, cookiefile, mode):
     # Different player clients expose different (and differently-protected) caption
-    # URLs. Try several; unknown client names are skipped by yt-dlp.
+    # URLs. Try ALL of them; unknown client names are skipped by yt-dlp.
     attempts = [None, ['tv'], ['web_safari'], ['mweb'], ['ios'], ['android_vr']]
     if cookiefile:
         attempts += [['web_creator'], ['tv', 'web_creator', 'mweb']]
 
     last_exc = None
-    no_subs_count = 0
+    warnings = []
+    only_no_subs = True
     for clients in attempts:
+        log = _YDLLog()
         try:
             _pace_youtube_request()
-            with YoutubeDL(_ydl_opts(cookiefile, clients, skip_download=True, ignore_no_formats_error=True, user_agent=_UA)) as ydl:
+            with YoutubeDL(_ydl_opts(cookiefile, clients, user_agent=_UA, logger=log)) as ydl:
                 info = ydl.extract_info(video_url, download=False)
                 if not info:
                     raise SubtitleError('unavailable',
                                         "yt-dlp could not extract video info (private, deleted, or blocked).")
                 picked = _pick_sub_track(info, mode)
                 if picked is None:
-                    raise SubtitleError(
-                        'no_subs',
-                        "No subtitles listed for this video (captions may not be generated yet for a "
-                        "very recent upload — it can take minutes to over a day).")
+                    raise SubtitleError('no_subs', f"client={clients or 'default'}: no tracks")
                 lang_code, track_url, is_auto, translate = picked
 
                 if translate:
@@ -574,15 +595,23 @@ def _get_subtitles_yt_dlp_impl(video_url, format_choice, cookiefile, mode):
             text = vtt_to_srt(vtt_text) if format_choice in ('srt', 'txt') else vtt_text
             return text, lang_code, is_auto
         except Exception as e:
+            warnings += log.msgs
             last_exc = e
             kind = classify_error(e)
             if kind in ('unavailable', 'disabled'):
                 raise
-            if kind == 'no_subs':
-                no_subs_count += 1
-                if no_subs_count >= 2:
-                    raise
+            if kind != 'no_subs':
+                only_no_subs = False
             continue
+
+    if only_no_subs:
+        w = ' | '.join(dict.fromkeys(warnings))[:400]
+        raise SubtitleError(
+            'no_subs',
+            "No caption tracks returned by any player client. Either the video truly has no "
+            "captions (check the CC button in the browser), or YouTube is hiding them without "
+            "cookies / a PO token (pip install bgutil-ytdlp-pot-provider)."
+            + (f" yt-dlp said: {w}" if w else ""))
     raise last_exc
 
 def get_subtitles_yt_dlp(video_url, format_choice, cookies_file, temp_dir, mode='original'):
@@ -839,11 +868,11 @@ def _report_results(results, cookies_file=None):
                 st.warning(f"⚠️ '{title}' is age-restricted. Upload cookies.txt from a logged-in, "
                            "age-verified account to access it.")
         elif kind == 'blocked':
-            hint = ("YouTube is blocking this IP. Wait several minutes, set 'Parallel downloads' to 1, "
-                    "use the Proxy field, or run the app from a different network "
-                    "(cloud hosts and VPNs are often blocked).")
+            hint = ("Couldn't confirm whether captions exist: YouTube is blocking this IP. Wait several "
+                    "minutes, set 'Parallel downloads' to 1, use the Proxy field, or run the app from a "
+                    "different network (cloud hosts and VPNs are often blocked).")
             if not cookies_file:
-                hint += " Uploading cookies can also help with YouTube's bot check."
+                hint += " Uploading cookies.txt also helps a lot."
             st.warning(f"⚠️ '{title}': {hint}\n\nDetails: {detail}")
         elif kind == 'disabled':
             st.warning(f"⚠️ '{title}': the uploader has disabled subtitles for this video.")
@@ -1071,7 +1100,8 @@ def main():
 
         st.markdown("---")
         st.markdown(
-            "**For Age-Restricted Videos**: upload cookies from a **logged-in, age-verified** account.\n"
+            "**Cookies (recommended; required for age-restricted videos).** Cookies from a "
+            "logged-in account fix most 'blocked' and 'no subs' results.\n"
             "1. Open a **private/incognito** window and log in to YouTube.\n"
             "2. Open any age-restricted video once (so the age check passes).\n"
             "3. With the \"Get cookies.txt LOCALLY\" extension, export `cookies.txt` for youtube.com.\n"
